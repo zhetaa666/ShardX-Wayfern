@@ -1,5 +1,14 @@
 # ShardX Launcher
 
+[![PyPI version](https://img.shields.io/pypi/v/shardx?style=flat-square&logo=pypi&logoColor=white&label=pypi&color=blue)](https://pypi.org/project/shardx/)
+[![npm version](https://img.shields.io/npm/v/@proxyshard/shardx?style=flat-square&logo=npm&logoColor=white&label=npm&color=red)](https://www.npmjs.com/package/@proxyshard/shardx)
+[![License](https://img.shields.io/github/license/ProxyShard/ShardBrowser?style=flat-square&color=informational)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/ProxyShard/ShardBrowser?style=flat-square&color=success)](https://github.com/ProxyShard/ShardBrowser/commits)
+
+[![GitHub stars](https://img.shields.io/github/stars/ProxyShard/ShardBrowser?style=flat-square&logo=github&label=Stars&color=lightgrey)](https://github.com/ProxyShard/ShardBrowser/stargazers)
+[![PyPI downloads](https://img.shields.io/pypi/dm/shardx?style=flat-square&logo=pypi&logoColor=white&label=pypi&color=brightgreen)](https://pypi.org/project/shardx/)
+[![npm downloads](https://img.shields.io/npm/dm/@proxyshard/shardx?style=flat-square&logo=npm&logoColor=white&label=npm&color=brightgreen)](https://www.npmjs.com/package/@proxyshard/shardx)
+
 A project by the **[ProxyShard](https://proxyshard.com)** team — the
 proxy service with full **SOCKS5 UDP relay** (RFC 1928 §7) and active
 **p0f TCP-fingerprint spoofing** on the exit (so the OS the proxy
@@ -13,6 +22,21 @@ spoofing at the engine level.
 * **Docs:**     <https://docs.proxyshard.com>
 * **UDP info:** <https://docs.proxyshard.com/eng/our-products/about-udp>
 * **p0f info:** <https://docs.proxyshard.com/eng/our-products/p0f-spoofing>
+
+Drive ShardX whichever way fits the job — all four read from the same
+on-disk state, so a profile is reachable from every entry-point with
+no sync step:
+
+* **Desktop UI** — workspace for day-to-day work (profiles, proxies,
+  cookies, fingerprint editor).
+* **Local HTTP API** — Bearer-JWT auth on `127.0.0.1:40325`; create /
+  start / stop profiles and grab a CDP endpoint from any language.
+* **MCP server** — drops into Claude Desktop / Cursor for
+  natural-language profile orchestration (HTTP API + browser-over-CDP).
+* **Standalone SDKs** — Python + Node libraries that ship the engine
+  themselves and need no GUI at all; ideal for scrapers / CI / servers.
+
+Setup for each lives in [Usage](#usage) below.
 
 <p align="center">
   <img src="docs/screenshots/00-launcher-workspace.jpg" alt="ShardX Launcher" width="820">
@@ -282,6 +306,124 @@ under
 * `~/.config/shardx-launcher/` (linux)
 
 and you're ready to bind a proxy and launch your first profile.
+
+---
+
+## Usage
+
+Four interchangeable ways to drive ShardX — pick whichever matches the
+job. All four read from the same on-disk state, so a profile created in
+the UI is reachable from the API, the MCP server and the SDKs without
+any sync step.
+
+### 1. Desktop UI
+
+Day-to-day workflow lives here. Open the app, add a proxy
+(*Proxies* → *Add proxy* — paste `socks5://user:pass@host:port` or
+bulk-paste a list, hit *Test* to run a TCP + UDP_ASSOCIATE + geo
+probe), bind it to a profile (*Profiles* → pick one → *Bind proxy*),
+and hit *Start*. The launcher takes care of:
+
+* downloading the engine + Widevine + 170 starter profiles on first
+  launch (etag-cached afterward);
+* per-profile `user-data-dir` so cookies / cache / extensions stay
+  isolated;
+* resolving timezone / locale / geolocation from the proxy's exit
+  country before each launch;
+* deciding QUIC + WebRTC policy from a live UDP probe — QUIC stays on
+  when the proxy supports UDP, off when it doesn't, no manual toggle
+  needed;
+* re-binding to the same `user-data-dir` next time so you get
+  *"Continue where you left off"* without the crash-restore bubble.
+
+Bulk import / export, folders, tags, pin-to-top, clone, cookie
+import / export (Chromium SQLite v10 / DPAPI), and a fingerprint
+editor that randomises coherent hardware (CPU ↔ RAM ↔ platform version)
+are all in the workspace.
+
+### 2. Local automation API
+
+An axum HTTP server bound to `127.0.0.1:40325` (port configurable in
+*Settings → Automation API*). Use this when you want to drive the
+launcher from your own code — Python, Go, curl, anything that speaks
+HTTP. Every endpoint except `GET /health` requires a Bearer JWT shown
+in *Settings → Automation API* (regenerate rotates the signing secret
+live).
+
+* **Reference docs:** <https://docs.proxyshard.com/eng/shardx-launcher-api/binding-and-lifecycle>
+* **OpenAPI schema:** [openapi.yaml](openapi.yaml)
+
+Launching a profile and getting a CDP endpoint:
+
+```bash
+TOKEN="<from Settings → Automation API>"
+BASE="http://127.0.0.1:40325"
+
+# Start the profile in CDP mode — returns the websocket the browser
+# is listening on. Reuse it with any CDP client (puppeteer, raw WS,
+# patchright, your own).
+curl -s -X POST "$BASE/profiles/win-rtx4060/start?cdp=true&headless=false" \
+     -H "Authorization: Bearer $TOKEN" | jq .
+# → {"id":"win-rtx4060","cdp_url":"ws://127.0.0.1:53217/devtools/browser/…","pid":48211}
+
+# Stop it.
+curl -s -X POST "$BASE/profiles/win-rtx4060/stop" \
+     -H "Authorization: Bearer $TOKEN"
+```
+
+Endpoints cover profiles (create / edit / delete / start / stop / list
+running), proxies (add / delete / list), fingerprints (generate, list
+library), folders, cookies (export / import) and a fingerprint
+generator — full list in the OpenAPI file.
+
+### 3. MCP server
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server for
+Claude Desktop, Cursor and any other MCP client. Wraps both the
+launcher's HTTP API and the browser-over-CDP (via patchright) so a
+language model can:
+
+* manage profiles / proxies / fingerprints / folders / cookies through
+  the launcher;
+* navigate / click / type / wait / screenshot in a live ShardX
+  profile, with the profile auto-starting when needed.
+
+The app doesn't run the server itself — open *Settings → MCP server →
+Download MCP server*, pick a folder, then `npm install` and register
+with your MCP client. Full setup, env vars and tool list in
+**[mcp/README.md](mcp/README.md)**.
+
+Minimal stdio registration:
+
+```json
+{
+  "mcpServers": {
+    "shardx": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/mcp/index.js"],
+      "env": {
+        "SHARDX_API": "http://127.0.0.1:40325",
+        "SHARDX_TOKEN": "<Bearer token>"
+      }
+    }
+  }
+}
+```
+
+### 4. Standalone SDKs (Python / Node)
+
+Self-contained client libraries that **don't need the desktop app at
+all** — they download the same engine + fingerprint library on first
+use and launch profiles directly via subprocess, with [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright)
+(stealth Playwright) attached for control. Same pre-launch pipeline as
+the launcher: UDP probe → conditional QUIC, geo-resolve for auto
+fields, screen strategy, host-aware hardware randomisation.
+
+Use the SDK when you want ShardX as a library inside a scraper / CI
+job / server-side worker without installing the GUI.
+
+* **Python** — [sdks/python/README.md](sdks/python/README.md) — `pip install shardx`
+* **Node** — [sdks/node/README.md](sdks/node/README.md) — `npm install @proxyshard/shardx`
 
 ---
 
