@@ -292,6 +292,19 @@ cert), so the first launch is gated by the OS:
   re-prompt.
 * **Linux** — `.AppImage`: `chmod +x ShardX-Launcher.AppImage && ./ShardX-Launcher.AppImage`. `.deb`: `sudo apt install ./ShardX-Launcher.deb`.
 
+### Linux system dependencies
+
+The bundled Chromium engine needs `unzip` + the standard set of shared
+libraries any Chromium fork links against. On a fresh Debian / Ubuntu:
+
+```bash
+sudo apt install -y \
+  unzip ca-certificates fonts-liberation \
+  libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+  libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+  libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1
+```
+
 ### Option B — build from source
 
 ```bash

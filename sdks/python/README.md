@@ -20,6 +20,26 @@ pip install shardx
 
 Supported hosts: **macOS arm64**, **Windows x64**, **Linux x64**.
 
+### Linux system dependencies
+
+The bundled Chromium engine needs `unzip` + the standard set of shared
+libraries any Chromium fork links against. On a fresh Debian / Ubuntu:
+
+```bash
+sudo apt install -y \
+  unzip ca-certificates fonts-liberation \
+  libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+  libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+  libgbm1 libpango-1.0-0 libcairo2 libasound2 libxshmfence1
+```
+
+When launching as **root** or inside **Docker**, pass `--no-sandbox` and
+`--disable-dev-shm-usage` via `extra_args=`:
+
+```python
+await sdk.session(..., extra_args=["--no-sandbox", "--disable-dev-shm-usage"])
+```
+
 ## Quick start
 
 ```python
