@@ -25,10 +25,10 @@ of those proxies: the launcher manages profiles, binds proxies, and
 ships the patched **Chromium 148** browser that does the actual
 spoofing at the engine level.
 
-* **Site:**     <https://proxyshard.com?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher>
-* **Docs:**     <https://docs.proxyshard.com?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher>
-* **UDP info:** <https://docs.proxyshard.com/eng/our-products/about-udp?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher>
-* **p0f info:** <https://docs.proxyshard.com/eng/our-products/p0f-spoofing?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher>
+* **Site:**     [https://proxyshard.com](https://proxyshard.com?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)
+* **Docs:**     [https://docs.proxyshard.com](https://docs.proxyshard.com?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)
+* **UDP info:** [https://docs.proxyshard.com/eng/our-products/about-udp](https://docs.proxyshard.com/eng/our-products/about-udp?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)
+* **p0f info:** [https://docs.proxyshard.com/eng/our-products/p0f-spoofing](https://docs.proxyshard.com/eng/our-products/p0f-spoofing?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)
 
 Drive ShardX whichever way fits the job — all four read from the same
 on-disk state, so a profile is reachable from every entry-point with
@@ -370,7 +370,7 @@ HTTP. Every endpoint except `GET /health` requires a Bearer JWT shown
 in *Settings → Automation API* (regenerate rotates the signing secret
 live).
 
-* **Reference docs:** <https://docs.proxyshard.com/eng/shardx-launcher-api/binding-and-lifecycle?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher>
+* **Reference docs:** [https://docs.proxyshard.com/eng/shardx-launcher-api/binding-and-lifecycle](https://docs.proxyshard.com/eng/shardx-launcher-api/binding-and-lifecycle?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)
 * **OpenAPI schema:** [openapi.yaml](openapi.yaml)
 
 Launching a profile and getting a CDP endpoint:
