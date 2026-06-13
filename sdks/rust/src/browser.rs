@@ -16,6 +16,52 @@ use crate::proxy::{parse_proxy, probe_udp, proxy_to_arg, ParsedProxy, ProxySchem
 use crate::runtime::Runtime;
 use crate::screen::{apply_screen_strategy, default_screen_mode_for, ScreenStrategy};
 
+/// Deterministic non-zero 32-bit FNV-1a of `<id>::<slot>`.
+fn noise_seed(id: &str, slot: &str) -> u32 {
+    let mut h: u32 = 2166136261;
+    for b in format!("{id}::{slot}").bytes() {
+        h = (h ^ b as u32).wrapping_mul(16777619);
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// Add the default noise block when absent, then fill any seed-0 vector with a
+/// stable per-profile value — without it every profile shares seed 0 and gets
+/// an identical canvas/audio/WebGL fingerprint.
+fn apply_noise_seeds(config: &mut serde_json::Value, id: &str) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    obj.entry("noise").or_insert_with(|| {
+        serde_json::json!({
+            "canvas":       { "enabled": false, "seed": 0 },
+            "webgl":        { "enabled": false, "seed": 0, "intensity": 0 },
+            "audio":        { "enabled": false, "seed": 0 },
+            "client_rects": { "enabled": false, "seed": 0, "max_offset": 0 },
+            "sensors":      { "enabled": false, "seed": 0 },
+            "fonts":        { "enabled": false, "seed": 0 }
+        })
+    });
+    if let Some(noise) = obj.get_mut("noise").and_then(|n| n.as_object_mut()) {
+        for (slot, block) in noise.iter_mut() {
+            if let Some(b) = block.as_object_mut() {
+                let needs = b
+                    .get("seed")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n == 0)
+                    .unwrap_or(true);
+                if needs {
+                    b.insert("seed".into(), serde_json::Value::from(noise_seed(id, slot)));
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum WebRtcMode {
     #[default]
@@ -142,6 +188,7 @@ impl Browser {
             grease_brand.as_deref(),
             grease_version.as_deref(),
         );
+        apply_noise_seeds(&mut profile.config, &profile.id);
         let fp_file = udd.join("fingerprint.json");
         std::fs::write(&fp_file, serde_json::to_string(&profile.config)?)?;
 

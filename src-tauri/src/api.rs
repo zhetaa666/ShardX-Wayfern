@@ -227,6 +227,7 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
         let _ = crate::proxy::full_test(&stored).await;
         meta["proxy_id"] = json!(stored.id);
     }
+    crate::ensure_default_noise(&mut cfg);
     cfg.insert("_meta".into(), meta);
 
     let pm = crate::save_profile_core(crate::main_window().as_ref(), Value::Object(cfg), false)

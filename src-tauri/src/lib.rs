@@ -574,7 +574,28 @@ pub fn build_fingerprint_config(
 ) -> Result<serde_json::Map<String, Value>, String> {
     let mut merged = merge_library_fingerprint(template_id)?;
     enrich_new_config(window, &mut merged);
+    ensure_default_noise(&mut merged);
     Ok(merged)
+}
+
+/// Add the UI's default noise block (every vector present, disabled, seed 0 —
+/// the sentinel `save_raw` fills per-profile) when a config carries none, so
+/// API/SDK profiles match UI profiles and get a unique seed instead of none.
+pub fn ensure_default_noise(cfg: &mut serde_json::Map<String, Value>) {
+    if cfg.contains_key("noise") {
+        return;
+    }
+    cfg.insert(
+        "noise".into(),
+        serde_json::json!({
+            "canvas":       { "enabled": false, "seed": 0 },
+            "webgl":        { "enabled": false, "seed": 0, "intensity": 0 },
+            "audio":        { "enabled": false, "seed": 0 },
+            "client_rects": { "enabled": false, "seed": 0, "max_offset": 0 },
+            "sensors":      { "enabled": false, "seed": 0 },
+            "fonts":        { "enabled": false, "seed": 0 }
+        }),
+    );
 }
 
 #[derive(serde::Serialize)]
@@ -1076,11 +1097,34 @@ async fn ps_set_tag(id: i64, tag: String) -> Result<Value, String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Bring the main window back from the tray / minimized state and focus it.
+fn show_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
+        // Must be the first plugin: a second launch focuses the running window.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let to_tray = settings::load().map(|s| s.minimize_to_tray).unwrap_or(true);
+                if window.label() == "main" && to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             profile_list,
             profile_get,
@@ -1152,6 +1196,37 @@ pub fn run() {
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                let show = MenuItem::with_id(app, "tray_show", "Show Launcher", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "tray_quit", "Quit", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show, &quit])?;
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    TrayIconBuilder::with_id("main")
+                        .icon(icon)
+                        .tooltip("ShardX Launcher")
+                        .menu(&menu)
+                        .show_menu_on_left_click(false)
+                        .on_menu_event(|app, e| match e.id.as_ref() {
+                            "tray_show" => show_main_window(app),
+                            "tray_quit" => app.exit(0),
+                            _ => {}
+                        })
+                        .on_tray_icon_event(|tray, e| {
+                            if let TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            } = e
+                            {
+                                show_main_window(tray.app_handle());
+                            }
+                        })
+                        .build(app)?;
+                }
+            }
 
             // Win/Linux: strip native caption since macOS-only titleBarStyle:Overlay leaves it.
             #[cfg(not(target_os = "macos"))]

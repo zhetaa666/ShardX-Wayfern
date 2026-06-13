@@ -29,6 +29,36 @@ from .proxy import ParsedProxy, parse_proxy, probe_udp
 from .runtime import Runtime, apply_engine_version
 from .screen import apply_screen_strategy, default_mode_for
 
+_NOISE_DEFAULT = {
+    "canvas":       {"enabled": False, "seed": 0},
+    "webgl":        {"enabled": False, "seed": 0, "intensity": 0},
+    "audio":        {"enabled": False, "seed": 0},
+    "client_rects": {"enabled": False, "seed": 0, "max_offset": 0},
+    "sensors":      {"enabled": False, "seed": 0},
+    "fonts":        {"enabled": False, "seed": 0},
+}
+
+
+def _noise_seed(profile_id: str, slot: str) -> int:
+    """Deterministic non-zero 32-bit FNV-1a of `<id>::<slot>`."""
+    h = 2166136261
+    for b in f"{profile_id}::{slot}".encode():
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h or 1
+
+
+def apply_noise_seeds(config: dict, profile_id: str) -> None:
+    """Add the default noise block when absent, then fill any seed-0 vector
+    with a stable per-profile value — without it every profile would share
+    seed 0 and produce an identical canvas/audio/WebGL fingerprint."""
+    noise = config.get("noise")
+    if not isinstance(noise, dict):
+        noise = {k: dict(v) for k, v in _NOISE_DEFAULT.items()}
+        config["noise"] = noise
+    for slot, block in noise.items():
+        if isinstance(block, dict) and not block.get("seed"):
+            block["seed"] = _noise_seed(profile_id, slot)
+
 
 @dataclass
 class BrowserSession:
@@ -124,6 +154,7 @@ class Browser:
             self.runtime.grease_brand,
             self.runtime.grease_version,
         )
+        apply_noise_seeds(profile.config, profile.id)
         fp_file = udd / "fingerprint.json"
         fp_file.write_text(json.dumps(profile.config))
 

@@ -174,6 +174,62 @@ pub fn load_raw(id: &str) -> Result<StoredProfile> {
     Ok(stored)
 }
 
+/// Deterministic non-zero 32-bit seed from the profile id + noise slot (FNV-1a).
+/// Same id + slot always yields the same seed (stable fingerprint across
+/// launches/edits); different ids yield different seeds (unique per profile).
+fn derive_noise_seed(id: &str, slot: &str) -> u32 {
+    let s = format!("{id}::{slot}");
+    let mut h: u32 = 2166136261;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    // 0 is the "derive automatically" sentinel — never hand it back as a value.
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+/// Replace every auto-sentinel noise seed (`seed == 0` or absent) with a
+/// stable per-profile value derived from the final profile id.  The UI can't
+/// know the id at create time, so it sends `seed: 0` for every vector; without
+/// this every freshly-created profile would otherwise share one placeholder
+/// seed and produce an identical canvas/audio/WebGL fingerprint.
+fn fill_noise_seeds(config: &mut serde_json::Map<String, serde_json::Value>, id: &str) {
+    let Some(noise) = config.get_mut("noise").and_then(|n| n.as_object_mut()) else {
+        return;
+    };
+    for (slot, block) in noise.iter_mut() {
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        let needs = obj
+            .get("seed")
+            .and_then(|v| v.as_u64())
+            .map(|n| n == 0)
+            .unwrap_or(true);
+        if needs {
+            obj.insert("seed".into(), serde_json::Value::from(derive_noise_seed(id, slot)));
+        }
+    }
+}
+
+/// Reset every noise seed back to the auto sentinel so the next `save_raw`
+/// re-derives them from a fresh id.  Used when cloning so the copy doesn't
+/// inherit the source's canvas/audio/WebGL fingerprint.
+fn clear_noise_seeds(config: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(noise) = config.get_mut("noise").and_then(|n| n.as_object_mut()) else {
+        return;
+    };
+    for (_, block) in noise.iter_mut() {
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert("seed".into(), serde_json::Value::from(0u32));
+        }
+    }
+}
+
 pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     let is_new = stored.meta.id.is_empty();
     if is_new {
@@ -203,6 +259,10 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     if stored.meta.created_at.is_none() {
         stored.meta.created_at = Some(chrono_now_iso());
     }
+    // The id is now final (freshly minted for new profiles, carried through for
+    // edits) — derive per-profile noise seeds from it so each profile gets a
+    // unique-but-stable fingerprint instead of sharing the UI's placeholder.
+    fill_noise_seeds(&mut stored.config, &stored.meta.id);
     let path = path_for(&stored.meta.id)?;
     let body = serde_json::to_string_pretty(stored)?;
     fs::write(path, body)?;
@@ -260,6 +320,10 @@ pub fn clone_profile(id: &str) -> Result<ProfileMeta> {
     // Re-randomize CPU/RAM/platform_version so the copy doesn't collide on those axes.
     crate::randomize_platform_version(&mut src.config);
     crate::randomize_hardware(&mut src.config);
+    // Same reasoning for the fingerprint noise: drop the source's seeds so
+    // save_raw re-derives fresh ones from new_id, giving the copy its own
+    // canvas/audio/WebGL fingerprint instead of a clone of the original's.
+    clear_noise_seeds(&mut src.config);
     save_raw(&mut src)?;
     Ok(ProfileMeta {
         id: src.meta.id,

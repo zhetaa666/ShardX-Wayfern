@@ -18,6 +18,9 @@ pub struct Settings {
     /// "real" (let ShardX use the host's real screen).
     #[serde(default)]
     pub screen_resolution_mode: Option<String>,
+    /// Hide the launcher to the system tray on close instead of quitting.
+    #[serde(default = "default_minimize_to_tray")]
+    pub minimize_to_tray: bool,
 
     // ---- Local automation HTTP API (axum + JWT bearer) ----
     /// Whether the local API server listens on 127.0.0.1:`api_port`.
@@ -36,6 +39,10 @@ fn default_theme() -> String {
     "dark".into()
 }
 
+fn default_minimize_to_tray() -> bool {
+    true
+}
+
 fn default_api_enabled() -> bool {
     true
 }
@@ -52,6 +59,7 @@ pub fn load() -> Result<Settings> {
             theme: default_theme(),
             geo_checker: Some("ip-api.com".into()),
             screen_resolution_mode: Some("fingerprint".into()),
+            minimize_to_tray: default_minimize_to_tray(),
             api_enabled: default_api_enabled(),
             api_port: default_api_port(),
             api_secret: String::new(),

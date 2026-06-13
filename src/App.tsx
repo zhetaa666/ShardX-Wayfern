@@ -521,16 +521,12 @@ function fromStored(stored: any): ProfileForm {
   return f;
 }
 
-/// Deterministic per-profile per-slot 32-bit hash (stable noise seeds).
-function noiseSeed(profileId: string, slot: string): number {
-  const s = `${profileId || "new"}::${slot}`;
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
+// "Maximally soft" anti-fingerprint defaults: the smallest perturbation that
+// still shifts the fingerprint hash without visibly degrading rendering.
+// max_offset can't drop below 1 (0 = off), so client_rects is already at its
+// gentlest floor.
+const WEBGL_NOISE_INTENSITY = 0.0005;
+const CLIENT_RECTS_MAX_OFFSET = 1;
 
 /// Build on-disk FingerprintConfig from library payload + user-edited fields.
 function toStored(f: ProfileForm, lib: FingerprintEntry | null): any {
@@ -579,13 +575,18 @@ function toStored(f: ProfileForm, lib: FingerprintEntry | null): any {
       ? { mode: "manual", latitude: f.geo_lat, longitude: f.geo_lng, accuracy: f.geo_accuracy }
       : { mode: "auto" };
 
+  // seed: 0 is the "derive automatically" sentinel — the launcher fills each
+  // vector with a stable per-profile seed once the real profile id exists
+  // (see fill_noise_seeds in profile.rs).  Computing seeds here is impossible
+  // for new profiles (no id yet) and previously collapsed every new profile
+  // onto one shared seed, giving them all an identical fingerprint.
   base.noise = {
-    canvas:       { enabled: f.noise_canvas === "auto",       seed: noiseSeed(f.id, "canvas") },
-    webgl:        { enabled: f.noise_webgl === "auto",        seed: noiseSeed(f.id, "webgl"), intensity: f.noise_webgl === "auto" ? 0.0005 : 0 },
-    audio:        { enabled: f.noise_audio === "auto",        seed: noiseSeed(f.id, "audio") },
-    client_rects: { enabled: f.noise_client_rects === "auto", seed: noiseSeed(f.id, "client_rects"), max_offset: f.noise_client_rects === "auto" ? 1 : 0 },
-    sensors:      { enabled: f.noise_sensors === "auto",      seed: noiseSeed(f.id, "sensors") },
-    fonts:        { enabled: f.noise_fonts === "auto",        seed: noiseSeed(f.id, "fonts") },
+    canvas:       { enabled: f.noise_canvas === "auto",       seed: 0 },
+    webgl:        { enabled: f.noise_webgl === "auto",        seed: 0, intensity: f.noise_webgl === "auto" ? WEBGL_NOISE_INTENSITY : 0 },
+    audio:        { enabled: f.noise_audio === "auto",        seed: 0 },
+    client_rects: { enabled: f.noise_client_rects === "auto", seed: 0, max_offset: f.noise_client_rects === "auto" ? CLIENT_RECTS_MAX_OFFSET : 0 },
+    sensors:      { enabled: f.noise_sensors === "auto",      seed: 0 },
+    fonts:        { enabled: f.noise_fonts === "auto",        seed: 0 },
   };
   base.blocked_ports = [...f.blocked_ports].sort((a, b) => a - b);
 
@@ -1015,6 +1016,12 @@ function BrowsersView() {
       localStorage.setItem("shardx-folders", JSON.stringify(next));
       return next;
     });
+  const forgetFolder = (f: string) =>
+    setFolderRegistry((r) => {
+      const next = r.filter((x) => x !== f);
+      localStorage.setItem("shardx-folders", JSON.stringify(next));
+      return next;
+    });
   const ctx = useContextMenu();
 
   const reload = async () => {
@@ -1231,6 +1238,14 @@ function BrowsersView() {
   };
 
   const setProfileFolder = async (id: string, f: string) => {
+    // Dropping a profile onto the folder it already lives in is a no-op —
+    // tell the user instead of silently doing nothing.
+    const p = profiles.find((x) => x.id === id);
+    if (p && p.folder === f) {
+      const who = p.name || id.slice(0, 8);
+      toast.info(f ? `“${who}” is already in “${f}”` : `“${who}” isn’t in any folder`);
+      return;
+    }
     try {
       await invoke("profile_set_folder", { id, folder: f });
       if (f) rememberFolder(f);
@@ -1264,6 +1279,10 @@ function BrowsersView() {
     const alsoDelete = choice === "delete";
     try {
       const n = await invoke<number>("folder_delete", { folder: f, deleteProfiles: alsoDelete });
+      // The folder lives in two places: profile tags (cleared by folder_delete)
+      // and the localStorage registry of empty folders.  Drop it from the
+      // registry too, otherwise the tab lingers after every profile is gone.
+      forgetFolder(f);
       if (folder === f) setFolder("all");
       reload();
       toast.ok(
