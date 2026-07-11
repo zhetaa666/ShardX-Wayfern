@@ -3460,14 +3460,16 @@ function WayfernModal({ onClose }: { onClose: () => void }) {
                 <div style={{ marginTop: 14 }}>
                   <div className="muted small" style={{ marginBottom: 6, textAlign: "left" }}>
                     {prog.phase === "download"
-                      ? `Downloading — ${fmt(prog.received)} / ${fmt(prog.total)}  (${prog.percent}%)`
+                      ? prog.total > 0
+                        ? `Downloading — ${fmt(prog.received)} / ${fmt(prog.total)}  (${prog.percent}%)`
+                        : `Downloading — ${fmt(prog.received)}`
                       : "Extracting…"}
                   </div>
                   <div style={{ height: 8, background: "var(--bg-muted, #1f1f24)", borderRadius: 4, overflow: "hidden" }}>
                     <div
                       style={{
                         height: "100%",
-                        width: `${prog.percent}%`,
+                        width: `${prog.total > 0 ? prog.percent : 100}%`,
                         background: "var(--accent, #7c8cff)",
                         transition: "width 120ms linear",
                       }}

@@ -9,6 +9,7 @@
 //! "url", ... } }`. No per-platform size field — hence the HEAD probe.
 
 use anyhow::{Context, Result};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -112,17 +113,47 @@ async fn fetch_release() -> Result<WayfernRelease> {
         .with_context(|| format!("no Wayfern release for host `{key}`"))?
         .to_string();
 
-    let head = client
-        .head(&download_url)
-        .send()
-        .await
-        .context("HEAD request for Wayfern archive failed")?
-        .error_for_status()?;
-    let size = head
-        .content_length()
-        .context("Wayfern CDN response missing Content-Length")?;
+    let size = probe_archive_size(&client, &download_url).await?;
 
     Ok(WayfernRelease { version, download_url, size })
+}
+
+async fn probe_archive_size(client: &reqwest::Client, url: &str) -> Result<u64> {
+    if let Ok(resp) = client.head(url).send().await {
+        let resp = resp.error_for_status()?;
+        if let Some(size) = content_length(&resp) {
+            return Ok(size);
+        }
+    }
+
+    let resp = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .send()
+        .await
+        .context("Wayfern archive size probe failed")?
+        .error_for_status()?;
+    if let Some(size) = resp
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_total)
+    {
+        return Ok(size);
+    }
+    content_length(&resp).context("Wayfern CDN response missing a usable archive size")
+}
+
+fn content_length(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
+fn parse_content_range_total(s: &str) -> Option<u64> {
+    s.rsplit_once('/')?.1.parse::<u64>().ok().filter(|&n| n > 0)
 }
 
 fn host_platform_key() -> &'static str {
@@ -327,4 +358,17 @@ fn flatten_single_child(dir: &Path) -> Result<()> {
     }
     let _ = fs::remove_dir(&sub);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_content_range_total;
+
+    #[test]
+    fn parses_content_range_total() {
+        assert_eq!(parse_content_range_total("bytes 0-0/1057916705"), Some(1_057_916_705));
+        assert_eq!(parse_content_range_total("bytes */1057916705"), Some(1_057_916_705));
+        assert_eq!(parse_content_range_total("bytes 0-0/*"), None);
+        assert_eq!(parse_content_range_total("not-a-range"), None);
+    }
 }
