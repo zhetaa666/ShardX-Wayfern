@@ -301,6 +301,20 @@ type FingerprintEntry = {
   payload: any;
 };
 
+type WayfernStatus = {
+  installed: boolean;
+  binary_path: string | null;
+  version: string | null;
+  size_bytes: number | null;
+};
+type WayfernProgress = {
+  phase: "download" | "extract";
+  version: string;
+  percent: number;
+  received: number;
+  total: number;
+};
+
 // ---- profile form ----
 
 type NoiseMode = "real" | "auto";
@@ -3209,6 +3223,7 @@ function ProxyEditor({ initial, onClose }: { initial: ProxyEntry; onClose: () =>
 function FingerprintsView() {
   const [items, setItems] = useState<FingerprintEntry[]>([]);
   const [importerOpen, setImporterOpen] = useState(false);
+  const [wayfernOpen, setWayfernOpen] = useState(false);
 
   const reload = () =>
     invoke<FingerprintEntry[]>("fingerprint_list").then(setItems).catch((e) => toast.err(String(e)));
@@ -3268,6 +3283,9 @@ function FingerprintsView() {
             <Icon.Folder /> Library folder
           </button>
           <button className="btn-ghost" onClick={importJsonFile}><Icon.Folder /> Import from file</button>
+          <button className="btn-ghost" onClick={() => setWayfernOpen(true)} title="Spawn Wayfern engine and capture a fresh live-Chrome fingerprint">
+            <ShardMini /> Generate via Wayfern
+          </button>
           <button className="btn-primary" onClick={() => setImporterOpen(true)}>+ Paste JSON</button>
         </div>
       </div>
@@ -3282,6 +3300,9 @@ function FingerprintsView() {
       )}
       {importerOpen && (
         <FingerprintImporter onClose={() => { setImporterOpen(false); reload(); }} />
+      )}
+      {wayfernOpen && (
+        <WayfernModal onClose={() => { setWayfernOpen(false); reload(); }} />
       )}
     </section>
   );
@@ -3341,6 +3362,163 @@ function LibraryGroups({
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/// Wayfern engine wizard: download the ~1 GB engine if missing, then spawn it
+/// headlessly, grab a fresh CDP fingerprint, convert to a ShardX
+/// FingerprintConfig, and import into the library.
+function WayfernModal({ onClose }: { onClose: () => void }) {
+  const [status, setStatus] = useState<WayfernStatus | null>(null);
+  const [prog, setProg] = useState<WayfernProgress | null>(null);
+  const [busy, setBusy] = useState<"idle" | "installing" | "generating">("idle");
+  const [err, setErr] = useState<string | null>(null);
+  const [label, setLabel] = useState("");
+
+  const fmt = (b: number) =>
+    b < 1024 * 1024
+      ? `${(b / 1024).toFixed(0)} KB`
+      : b < 1024 * 1024 * 1024
+        ? `${(b / (1024 * 1024)).toFixed(1)} MB`
+        : `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+
+  useEffect(() => {
+    let cancelled = false;
+    let unProg: (() => void) | undefined;
+    let unDone: (() => void) | undefined;
+    (async () => {
+      unProg = await listen<WayfernProgress>("wayfern:progress", (e) => {
+        if (!cancelled) setProg(e.payload);
+      });
+      unDone = await listen<string>("wayfern:done", () => {
+        if (!cancelled) setProg(null);
+      });
+      try {
+        const s = await invoke<WayfernStatus>("wayfern_status");
+        if (!cancelled) setStatus(s);
+      } catch (e: any) {
+        if (!cancelled) setErr(String(e));
+      }
+    })();
+    return () => { cancelled = true; unProg?.(); unDone?.(); };
+  }, []);
+
+  const install = async () => {
+    setBusy("installing");
+    setErr(null);
+    try {
+      const s = await invoke<WayfernStatus>("wayfern_install", { force: false });
+      setStatus(s);
+    } catch (e: any) {
+      setErr(typeof e === "string" ? e : (e?.message ?? String(e)));
+    } finally {
+      setBusy("idle");
+      setProg(null);
+    }
+  };
+
+  const generate = async () => {
+    setBusy("generating");
+    setErr(null);
+    try {
+      const entry = await invoke<FingerprintEntry>("wayfern_generate_fingerprint", {
+        label: label.trim() || null,
+      });
+      toast.ok(`Generated "${entry.label}" — Chrome ${entry.chrome}`);
+      onClose();
+    } catch (e: any) {
+      setErr(typeof e === "string" ? e : (e?.message ?? String(e)));
+    } finally {
+      setBusy("idle");
+    }
+  };
+
+  const installed = status?.installed === true;
+
+  return (
+    <div className="dialog-bg" onClick={busy === "idle" ? onClose : undefined}>
+      <div className="dialog" onClick={(e) => e.stopPropagation()}>
+        <header className="dialog-head">
+          <h2><ShardMini /> Generate fingerprint via Wayfern</h2>
+          <button className="icon-btn" onClick={onClose} disabled={busy !== "idle"}>✕</button>
+        </header>
+        <div className="dialog-body">
+          {status === null ? (
+            <p className="muted small">Checking engine status…</p>
+          ) : !installed ? (
+            <>
+              <p className="small">
+                Wayfern is a modified Chromium build that exposes a real, per-launch
+                fingerprint (canvas noise, WebGL renderer, screen dims, fonts…).
+                One-time download from the Donut CDN.
+              </p>
+              <p className="muted small" style={{ marginTop: 6 }}>
+                Archive is ~1 GB compressed; installs under your app data directory.
+              </p>
+              {prog && (
+                <div style={{ marginTop: 14 }}>
+                  <div className="muted small" style={{ marginBottom: 6, textAlign: "left" }}>
+                    {prog.phase === "download"
+                      ? `Downloading — ${fmt(prog.received)} / ${fmt(prog.total)}  (${prog.percent}%)`
+                      : "Extracting…"}
+                  </div>
+                  <div style={{ height: 8, background: "var(--bg-muted, #1f1f24)", borderRadius: 4, overflow: "hidden" }}>
+                    <div
+                      style={{
+                        height: "100%",
+                        width: `${prog.percent}%`,
+                        background: "var(--accent, #7c8cff)",
+                        transition: "width 120ms linear",
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <p className="small">
+                Wayfern engine installed{status.version ? ` (v${status.version})` : ""}
+                {status.size_bytes ? ` — ${fmt(status.size_bytes)} on disk` : ""}.
+              </p>
+              <p className="muted small" style={{ marginTop: 6 }}>
+                Clicking Generate spawns a headless Wayfern, captures one fresh
+                fingerprint over CDP, converts it to ShardX schema, and adds it
+                to your library. Takes a few seconds.
+              </p>
+              <div style={{ marginTop: 12 }}>
+                <Field
+                  label="Label (optional)"
+                  value={label}
+                  onChange={setLabel}
+                  placeholder="e.g. wf-win11-chrome149-a"
+                />
+              </div>
+            </>
+          )}
+          {err && (
+            <p className="small" style={{ color: "var(--err, #ff6b6b)", marginTop: 12 }}>
+              {err}
+            </p>
+          )}
+        </div>
+        <footer className="dialog-foot">
+          <button className="btn-ghost" onClick={onClose} disabled={busy !== "idle"}>
+            {busy === "idle" ? "Close" : "Working…"}
+          </button>
+          {status !== null && !installed && (
+            <button className="btn-primary" onClick={install} disabled={busy !== "idle"}>
+              <Icon.Download /> {busy === "installing" ? "Downloading…" : "Download engine (~1 GB)"}
+            </button>
+          )}
+          {installed && (
+            <button className="btn-primary" onClick={generate} disabled={busy !== "idle"}>
+              <ShardMini /> {busy === "generating" ? "Generating…" : "Generate fingerprint"}
+            </button>
+          )}
+        </footer>
+      </div>
     </div>
   );
 }
