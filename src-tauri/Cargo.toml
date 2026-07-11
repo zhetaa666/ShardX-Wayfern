@@ -51,6 +51,10 @@ sha2 = "0.10"
 # Self-bootstrapping runtime: zip extraction of the chrome bundle
 # downloaded from Cloudflare R2 on first launch (src/runtime.rs).
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Wayfern engine: CDP client speaks WebSocket to headless chrome.exe
+# to call Wayfern.getFingerprint (no auth, page-level).
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

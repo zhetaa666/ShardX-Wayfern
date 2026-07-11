@@ -12,6 +12,7 @@ mod psapi;
 mod runtime;
 mod settings;
 mod store;
+mod wayfern;
 
 use serde_json::Value;
 
@@ -1206,6 +1207,9 @@ pub fn run() {
             runtime::runtime_status,
             runtime::runtime_install,
             runtime::launcher_update_check,
+            wayfern::wayfern_status,
+            wayfern::wayfern_install,
+            wayfern::wayfern_generate_fingerprint,
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());

@@ -1,0 +1,72 @@
+# Fast CI: cargo check + wayfern-module unit tests on every push to main
+# and every PR. Does not build the Tauri bundle (that's release.yml's job on
+# tag push) — this only verifies the Rust code compiles for our target
+# platforms and the pure-logic tests pass.
+#
+# The Wayfern bridge (src-tauri/src/wayfern/) has network-free unit tests for
+# the schema converter; those catch the most likely regressions cheaply.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: win-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+
+    runs-on: ${{ matrix.os }}
+    name: check (${{ matrix.label }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust (stable, ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ci-${{ matrix.label }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ci-${{ matrix.label }}-
+
+      # Tauri needs a few native libs on Linux even for `cargo check`.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --lib --target ${{ matrix.target }}
+
+      # Only run tests on Windows: our wayfern tests are OS-agnostic pure
+      # logic, but running once is enough — no need to double the bill.
+      - name: cargo test (wayfern module only)
+        if: runner.os == 'Windows'
+        working-directory: src-tauri
+        run: cargo test --lib --target ${{ matrix.target }} wayfern::
