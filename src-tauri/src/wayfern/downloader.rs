@@ -1,13 +1,12 @@
 //! Wayfern binary auto-downloader.
 //!
-//! Fetches the manifest from Donut CDN, downloads the platform archive with
-//! resume support, verifies the size against the manifest, and unzips into
-//! `$DATA/shardx-launcher/wayfern/<version>/`. Emits `wayfern:progress` and
-//! `wayfern:done` events to the frontend.
+//! Fetches the manifest from Donut CDN, HEAD-probes the archive size, streams
+//! the download with resume support, verifies the final size against the
+//! HEAD, and unzips into `$DATA/shardx-launcher/wayfern/<version>/`. Emits
+//! `wayfern:progress` and `wayfern:done` events to the frontend.
 //!
-//! The Node.js prototype at `wayfern-fresh/extract-verify.mjs` established
-//! the manifest URL, archive size (1_057_916_705 bytes on Windows x64), and
-//! zip layout — this is the Rust port.
+//! Manifest shape (as of 2026-07): `{ version, downloads: { "windows-x64":
+//! "url", ... } }`. No per-platform size field — hence the HEAD probe.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -80,7 +79,9 @@ pub fn dir_size(dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Fetch the manifest and pick the archive for this host.
+/// Fetch the manifest, pick the archive for this host, and probe its size via
+/// a HEAD request (manifest at `donutbrowser.com/wayfern.json` doesn't include
+/// per-platform sizes; the CDN sends `Content-Length` + `Accept-Ranges: bytes`).
 async fn fetch_release() -> Result<WayfernRelease> {
     let client = reqwest::Client::builder()
         .user_agent(CLIENT_UA)
@@ -99,38 +100,40 @@ async fn fetch_release() -> Result<WayfernRelease> {
         .context("manifest missing version")?
         .to_string();
 
-    let platforms = m
-        .get("platforms")
+    let downloads = m
+        .get("downloads")
         .and_then(|p| p.as_object())
-        .context("manifest missing platforms map")?;
+        .context("manifest missing downloads map")?;
 
     let key = host_platform_key();
-    let entry = platforms
+    let download_url = downloads
         .get(key)
-        .with_context(|| format!("no Wayfern release for host `{key}`"))?;
-
-    let download_url = entry
-        .get("download_url")
-        .and_then(|s| s.as_str())
-        .context("platform entry missing download_url")?
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("no Wayfern release for host `{key}`"))?
         .to_string();
-    let size = entry
-        .get("size")
-        .and_then(|s| s.as_u64())
-        .context("platform entry missing size")?;
+
+    let head = client
+        .head(&download_url)
+        .send()
+        .await
+        .context("HEAD request for Wayfern archive failed")?
+        .error_for_status()?;
+    let size = head
+        .content_length()
+        .context("Wayfern CDN response missing Content-Length")?;
 
     Ok(WayfernRelease { version, download_url, size })
 }
 
 fn host_platform_key() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    return "windows_x64";
+    return "windows-x64";
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return "macos_arm64";
+    return "macos-arm64";
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return "macos_x64";
+    return "macos-x64";
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    return "linux_x64";
+    return "linux-x64";
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
