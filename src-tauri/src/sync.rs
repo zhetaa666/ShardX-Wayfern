@@ -1,5 +1,6 @@
 use crate::{cookies, fingerprints, process, profile, proxy, settings, store};
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -146,6 +147,28 @@ pub async fn test_connection(base_url: String, token: String) -> Result<Value> {
     Ok(res.json::<Value>().await.unwrap_or_else(|_| json!({ "ok": true })))
 }
 
+pub async fn sync_on_startup() {
+    let Ok(s) = settings::load() else { return };
+    if !s.sync_enabled || s.sync_base_url.as_deref().unwrap_or("").is_empty() || s.sync_token.is_empty() {
+        return;
+    }
+    if let Err(e) = sync_now().await {
+        eprintln!("[sync] startup sync failed: {e}");
+    }
+}
+
+pub async fn sync_after_profile_close(profile_id: String) {
+    let Ok(s) = settings::load() else { return };
+    if !s.sync_enabled || s.sync_base_url.as_deref().unwrap_or("").is_empty() || s.sync_token.is_empty() {
+        return;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    match sync_now().await {
+        Ok(r) => eprintln!("[sync] after close {profile_id}: pushed {}, pulled {}, skipped {}", r.pushed, r.pulled, r.skipped),
+        Err(e) => eprintln!("[sync] after close {profile_id} failed: {e}"),
+    }
+}
+
 pub async fn sync_now() -> Result<SyncReport> {
     let mut s = configured()?;
     let base = clean_base_url(s.sync_base_url.as_deref().unwrap_or(""))?;
@@ -213,18 +236,32 @@ fn collect_local(s: &settings::Settings) -> Result<Vec<SyncItem>> {
                 revision: 0,
                 payload: json!({ "profile_id": meta.id, "cookies": ck }),
             });
+            let bundle = export_storage_bundle(&meta.id).unwrap_or_default();
+            if !bundle.is_empty() {
+                out.push(SyncItem {
+                    kind: "storage_bundle".into(),
+                    id: meta.id.clone(),
+                    updated_at: storage_updated_at(&meta.id)?,
+                    deleted_at: None,
+                    device_id: device.clone(),
+                    revision: 0,
+                    payload: json!({ "profile_id": meta.id, "format": "tar.gz+base64", "bytes": B64.encode(bundle) }),
+                });
+            }
         }
     }
 
-    out.push(SyncItem {
-        kind: "proxies".into(),
-        id: "default".into(),
-        updated_at: mtime_marker(&store::proxies_path()?),
-        deleted_at: None,
-        device_id: device.clone(),
-        revision: 0,
-        payload: serde_json::to_value(proxy::load()?)?,
-    });
+    for p in proxy::list()? {
+        out.push(SyncItem {
+            kind: "proxy".into(),
+            id: p.id.clone(),
+            updated_at: mtime_marker(&store::proxies_path()?),
+            deleted_at: None,
+            device_id: device.clone(),
+            revision: 0,
+            payload: serde_json::to_value(p)?,
+        });
+    }
 
     for fp in fingerprints::list_all()? {
         let path = store::fingerprints_dir()?.join(format!("{}.json", fp.id));
@@ -263,6 +300,11 @@ fn apply_remote(items: &[SyncItem]) -> Result<(usize, usize)> {
                 profile::save_raw(&mut stored)?;
                 applied += 1;
             }
+            "proxy" => {
+                let p: proxy::ProxyEntry = serde_json::from_value(item.payload.clone())?;
+                proxy::upsert(p)?;
+                applied += 1;
+            }
             "proxies" => {
                 let store_val: proxy::ProxyStore = serde_json::from_value(item.payload.clone())?;
                 for p in store_val.proxies {
@@ -295,14 +337,46 @@ fn apply_remote(items: &[SyncItem]) -> Result<(usize, usize)> {
                 cookies::import(profile_id, &cookies)?;
                 applied += 1;
             }
+            "storage_bundle" => {
+                let profile_id = item
+                    .payload
+                    .get("profile_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&item.id);
+                if process::Tracker::shared().is_running(profile_id) {
+                    skipped += 1;
+                    continue;
+                }
+                let Some(s) = item.payload.get("bytes").and_then(|v| v.as_str()) else {
+                    skipped += 1;
+                    continue;
+                };
+                let bytes = B64.decode(s)?;
+                import_storage_bundle(profile_id, &bytes)?;
+                applied += 1;
+            }
             _ => skipped += 1,
         }
     }
     Ok((applied, skipped))
 }
 
+fn storage_updated_at(profile_id: &str) -> Result<String> {
+    let udd = profile::user_data_dir(profile_id)?;
+    let mut latest = String::from("@0");
+    for path in storage_paths(&udd) {
+        let marker = mtime_marker(&path);
+        if marker > latest {
+            latest = marker;
+        }
+    }
+    Ok(if latest == "@0" { now_marker() } else { latest })
+}
+
 fn storage_paths(root: &Path) -> Vec<PathBuf> {
     [
+        "Default/History",
+        "Default/History-journal",
         "Default/Local Storage",
         "Default/IndexedDB",
         "Default/Session Storage",

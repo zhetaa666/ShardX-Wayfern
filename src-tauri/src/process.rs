@@ -96,6 +96,10 @@ impl Tracker {
                 if let Err(e) = crate::profile::add_runtime(&profile_id, elapsed_ms) {
                     eprintln!("[launcher] add_runtime({profile_id}) failed: {e}");
                 }
+                let sync_profile_id = profile_id.clone();
+                tokio::spawn(async move {
+                    crate::sync::sync_after_profile_close(sync_profile_id).await;
+                });
             }
             // Tear down temporary profile (config + udd) on close.
             if temporary {

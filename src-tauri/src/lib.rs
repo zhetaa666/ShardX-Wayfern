@@ -12,7 +12,7 @@ mod psapi;
 mod runtime;
 mod settings;
 mod store;
-mod sync;
+pub(crate) mod sync;
 mod wayfern;
 
 use serde_json::Value;
@@ -1315,6 +1315,14 @@ pub fn run() {
                 Ok(_) => {}
                 Err(e) => eprintln!("[launcher] temporary purge failed: {e}"),
             }
+
+            // Pull latest self-hosted sync state when the launcher opens.
+            tauri::async_runtime::spawn(async {
+                sync::sync_on_startup().await;
+                notify_store_changed("profiles");
+                notify_store_changed("proxies");
+                notify_store_changed("fingerprints");
+            });
 
             // API task on the shared tokio runtime.
             match settings::ensure_secret() {
