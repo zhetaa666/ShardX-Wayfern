@@ -1,0 +1,17 @@
+{
+  "name": "shardx-sync-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@fastify/multipart": "^9.0.3",
+    "better-sqlite3": "^11.8.1",
+    "fastify": "^5.2.1",
+    "minio": "^8.0.4"
+  }
+}
