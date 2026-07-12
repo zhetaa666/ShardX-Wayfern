@@ -382,11 +382,18 @@ fn profile_save(
     save_profile_core(Some(&window), payload, true)
 }
 
+fn is_wayfern_payload(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("_wayfern_extras")
+}
+
 /// Enrich a new profile in place: platform_version, hardware, screen clamp.
 pub fn enrich_new_config(
     window: Option<&tauri::WebviewWindow>,
     obj: &mut serde_json::Map<String, Value>,
 ) {
+    if is_wayfern_payload(obj) {
+        return;
+    }
     randomize_platform_version(obj);
     randomize_hardware(obj);
     if let Some(w) = window {
