@@ -107,6 +107,8 @@ pub fn wayfern_to_shardx(w: &Value, label: Option<&str>) -> Value {
             "color_gamut": color_gamut(w),
         },
         "webgl": {
+            "vendor": w.get("webglVendor").cloned().unwrap_or(json!("")),
+            "renderer": w.get("webglRenderer").cloned().unwrap_or(json!("")),
             "unmasked_vendor": w.get("webglVendor").cloned().unwrap_or(json!("")),
             "unmasked_renderer": w.get("webglRenderer").cloned().unwrap_or(json!("")),
         },
@@ -324,6 +326,8 @@ mod tests {
         assert_eq!(cfg["navigator"]["user_agent"], raw["userAgent"]);
         assert_eq!(cfg["screen"]["width"], 1920);
         assert_eq!(cfg["client_hints"]["brand_version"], "149");
+        assert_eq!(cfg["webgl"]["renderer"], raw["webglRenderer"]);
+        assert_eq!(cfg["webgl"]["unmasked_renderer"], raw["webglRenderer"]);
         assert!(cfg["noise"]["canvas"]["seed"].as_u64().unwrap() > 0);
         assert!(cfg["noise"]["webgl"]["seed"].as_u64().unwrap() > 0);
         assert_ne!(
