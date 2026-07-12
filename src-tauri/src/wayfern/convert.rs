@@ -112,12 +112,12 @@ pub fn wayfern_to_shardx(w: &Value, label: Option<&str>) -> Value {
         },
         "webgl": webgl_block(w),
         "noise": {
-            "canvas":       { "enabled": false, "seed": canvas_seed },
-            "webgl":        { "enabled": false, "seed": webgl_seed, "intensity": 0 },
-            "audio":        { "enabled": false, "seed": audio_seed, "intensity": 0 },
-            "client_rects": { "enabled": false, "seed": client_rects_seed, "max_offset": 0 },
-            "sensors":      { "enabled": false, "seed": sensors_seed },
-            "fonts":        { "enabled": false, "seed": fonts_seed },
+            "canvas":       { "enabled": true, "seed": canvas_seed },
+            "webgl":        { "enabled": true, "seed": webgl_seed, "intensity": 0.0005 },
+            "audio":        { "enabled": true, "seed": audio_seed, "intensity": 0.001 },
+            "client_rects": { "enabled": true, "seed": client_rects_seed, "max_offset": 1 },
+            "sensors":      { "enabled": true, "seed": sensors_seed },
+            "fonts":        { "enabled": true, "seed": fonts_seed },
         },
         "geolocation": geolocation,
         "media_devices": {
@@ -400,7 +400,10 @@ mod tests {
         assert_eq!(cfg["webgl"]["max_texture_size"], 16384);
         assert_eq!(cfg["webgl"]["max_vertex_attribs"], 16);
         assert_eq!(cfg["webgl"]["extensions"][0], "WEBGL_debug_renderer_info");
-        assert_eq!(cfg["noise"]["canvas"]["enabled"], false);
+        assert_eq!(cfg["noise"]["canvas"]["enabled"], true);
+        assert_eq!(cfg["noise"]["webgl"]["intensity"], 0.0005);
+        assert_eq!(cfg["noise"]["audio"]["intensity"], 0.001);
+        assert_eq!(cfg["noise"]["client_rects"]["max_offset"], 1);
         assert!(cfg["noise"]["canvas"]["seed"].as_u64().unwrap() > 0);
         assert!(cfg["noise"]["webgl"]["seed"].as_u64().unwrap() > 0);
         assert_ne!(
