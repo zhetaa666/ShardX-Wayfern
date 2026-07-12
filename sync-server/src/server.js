@@ -64,7 +64,7 @@ ON CONFLICT(workspace_id, kind, id) DO UPDATE SET
   revision=CASE WHEN excluded.revision > sync_items.revision THEN excluded.revision ELSE sync_items.revision + 1 END,
   payload=excluded.payload,
   checksum=excluded.checksum,
-  server_seq=NULL
+  server_seq=(SELECT COALESCE(MAX(server_seq), 0) + 1 FROM sync_items)
 WHERE excluded.updated_at >= sync_items.updated_at
 `);
 const changesStmt = db.prepare(`
