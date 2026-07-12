@@ -106,19 +106,18 @@ pub fn wayfern_to_shardx(w: &Value, label: Option<&str>) -> Value {
             "device_pixel_ratio": w.get("devicePixelRatio").cloned().unwrap_or(json!(1.0)),
             "color_gamut": color_gamut(w),
         },
-        "webgl": {
-            "vendor": w.get("webglVendor").cloned().unwrap_or(json!("")),
-            "renderer": w.get("webglRenderer").cloned().unwrap_or(json!("")),
-            "unmasked_vendor": w.get("webglVendor").cloned().unwrap_or(json!("")),
-            "unmasked_renderer": w.get("webglRenderer").cloned().unwrap_or(json!("")),
+        "audio": {
+            "sample_rate": w.get("audioSampleRate").cloned().unwrap_or(json!(48000)),
+            "channel_count": w.get("audioMaxChannelCount").cloned().unwrap_or(json!(2)),
         },
+        "webgl": webgl_block(w),
         "noise": {
-            "canvas":       { "enabled": true, "seed": canvas_seed },
-            "webgl":        { "enabled": true, "seed": webgl_seed, "intensity": 0.05 },
-            "audio":        { "enabled": true, "seed": audio_seed, "intensity": 0.001 },
-            "client_rects": { "enabled": true, "seed": client_rects_seed, "max_offset": 2 },
-            "sensors":      { "enabled": true, "seed": sensors_seed },
-            "fonts":        { "enabled": true, "seed": fonts_seed },
+            "canvas":       { "enabled": false, "seed": canvas_seed },
+            "webgl":        { "enabled": false, "seed": webgl_seed, "intensity": 0 },
+            "audio":        { "enabled": false, "seed": audio_seed, "intensity": 0 },
+            "client_rects": { "enabled": false, "seed": client_rects_seed, "max_offset": 0 },
+            "sensors":      { "enabled": false, "seed": sensors_seed },
+            "fonts":        { "enabled": false, "seed": fonts_seed },
         },
         "geolocation": geolocation,
         "media_devices": {
@@ -163,7 +162,9 @@ fn parse_ua(ua: &str) -> UaInfo {
         build: "7827".into(),
         patch: "116".into(),
     };
-    let Some(idx) = ua.find("Chrome/") else { return default };
+    let Some(idx) = ua.find("Chrome/") else {
+        return default;
+    };
     let rest = &ua[idx + 7..];
     let end = rest.find(' ').unwrap_or(rest.len());
     let ver = &rest[..end];
@@ -193,7 +194,11 @@ fn hex_to_u32(hex: &str) -> u32 {
         return 1;
     }
     let n = u32::from_str_radix(&cleaned, 16).unwrap_or(0);
-    if n == 0 { 1 } else { n }
+    if n == 0 {
+        1
+    } else {
+        n
+    }
 }
 
 fn fnv1a(s: &str) -> u32 {
@@ -202,7 +207,56 @@ fn fnv1a(s: &str) -> u32 {
         h ^= b as u32;
         h = h.wrapping_mul(0x0100_0193);
     }
-    if h == 0 { 1 } else { h }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+fn webgl_block(w: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "vendor".into(),
+        w.get("webglVendor").cloned().unwrap_or(json!("")),
+    );
+    out.insert(
+        "renderer".into(),
+        w.get("webglRenderer").cloned().unwrap_or(json!("")),
+    );
+    out.insert(
+        "unmasked_vendor".into(),
+        w.get("webglVendor").cloned().unwrap_or(json!("")),
+    );
+    out.insert(
+        "unmasked_renderer".into(),
+        w.get("webglRenderer").cloned().unwrap_or(json!("")),
+    );
+    out.insert("vendor_masked".into(), json!("WebKit"));
+    out.insert("renderer_masked".into(), json!("WebKit WebGL"));
+
+    merge_webgl_params(&mut out, w.get("webglParameters"));
+    merge_webgl_params(&mut out, w.get("webgl2Parameters"));
+    Value::Object(out)
+}
+
+fn merge_webgl_params(out: &mut serde_json::Map<String, Value>, raw: Option<&Value>) {
+    let Some(s) = raw.and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(s) else {
+        return;
+    };
+    let Some(obj) = v.as_object() else { return };
+    if let Some(ext) = obj.get("extensions").and_then(|v| v.as_array()) {
+        out.insert("extensions".into(), Value::Array(ext.clone()));
+    }
+    if let Some(n) = obj.get("3379") {
+        out.insert("max_texture_size".into(), n.clone());
+    }
+    if let Some(n) = obj.get("34921") {
+        out.insert("max_vertex_attribs".into(), n.clone());
+    }
 }
 
 fn ch_platform(platform: &str, ua: &str) -> &'static str {
@@ -233,11 +287,22 @@ fn ch_bitness(ua: &str) -> &'static str {
 }
 
 fn color_gamut(w: &Value) -> &'static str {
-    if w.get("colorGamutRec2020").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if w.get("colorGamutRec2020")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         "rec2020"
-    } else if w.get("colorGamutP3").and_then(|v| v.as_bool()).unwrap_or(false) {
+    } else if w
+        .get("colorGamutP3")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         "p3"
-    } else if w.get("colorGamutSrgb").and_then(|v| v.as_bool()).unwrap_or(false) {
+    } else if w
+        .get("colorGamutSrgb")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         "srgb"
     } else {
         ""
@@ -260,7 +325,10 @@ fn accept_language(w: &Value) -> String {
             return parts.join(",");
         }
     }
-    let l = w.get("language").and_then(|v| v.as_str()).unwrap_or("en-US");
+    let l = w
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("en-US");
     format!("{l},en;q=0.9")
 }
 
@@ -319,6 +387,7 @@ mod tests {
             "timezone": "America/New_York",
             "webglVendor": "Google Inc. (NVIDIA)",
             "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce RTX 3080)",
+            "webglParameters": "{\"3379\":16384,\"34921\":16,\"extensions\":[\"WEBGL_debug_renderer_info\"]}",
             "maxTouchPoints": 0,
         });
         let cfg = wayfern_to_shardx(&raw, Some("Test FP"));
@@ -328,6 +397,10 @@ mod tests {
         assert_eq!(cfg["client_hints"]["brand_version"], "149");
         assert_eq!(cfg["webgl"]["renderer"], raw["webglRenderer"]);
         assert_eq!(cfg["webgl"]["unmasked_renderer"], raw["webglRenderer"]);
+        assert_eq!(cfg["webgl"]["max_texture_size"], 16384);
+        assert_eq!(cfg["webgl"]["max_vertex_attribs"], 16);
+        assert_eq!(cfg["webgl"]["extensions"][0], "WEBGL_debug_renderer_info");
+        assert_eq!(cfg["noise"]["canvas"]["enabled"], false);
         assert!(cfg["noise"]["canvas"]["seed"].as_u64().unwrap() > 0);
         assert!(cfg["noise"]["webgl"]["seed"].as_u64().unwrap() > 0);
         assert_ne!(
