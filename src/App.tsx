@@ -290,13 +290,6 @@ type Settings = {
   sync_auto_push_secs?: number;
   sync_device_label?: string | null;
 };
-type LeaseState = {
-  held_by_me: boolean;
-  free: boolean;
-  holder_device: string;
-  holder_label?: string | null;
-  expires_at: number;
-};
 type ApiInfo = {
   enabled: boolean;
   port: number;
