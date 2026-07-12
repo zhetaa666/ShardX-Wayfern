@@ -286,6 +286,16 @@ type Settings = {
   sync_device_id?: string;
   sync_last_cursor?: string | null;
   sync_include_cookies?: boolean;
+  sync_pull_on_start?: boolean;
+  sync_auto_push_secs?: number;
+  sync_device_label?: string | null;
+};
+type LeaseState = {
+  held_by_me: boolean;
+  free: boolean;
+  holder_device: string;
+  holder_label?: string | null;
+  expires_at: number;
 };
 type ApiInfo = {
   enabled: boolean;
@@ -1143,6 +1153,17 @@ function BrowsersView() {
     invoke<FingerprintEntry[]>("fingerprint_list").then(setFingerprints).catch((e) => toast.err(String(e)));
   }, []);
 
+  // Backend emits this when pull-before-Start fails but we launch anyway
+  // (robust-offline path). Surface it as an info toast, don't block.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let disposed = false;
+    listen<{ profile_id: string; message: string }>("launch-warning", (e) => {
+      toast.info(e.payload.message);
+    }).then((fn) => { if (disposed) fn(); else un = fn; });
+    return () => { disposed = true; un?.(); };
+  }, []);
+
   // Scroll the expanded editor into view after expand animation.
   useEffect(() => {
     if (!expanded || expanded === "__new__") return;
@@ -1248,6 +1269,8 @@ function BrowsersView() {
   // state for the whole window is what the user sees as "did it work?".
   // On failure we unlock immediately and toast the error.
   const [startBusy, setStartBusy] = useState<Set<string>>(new Set());
+  // Profiles reported "open on another device" — shows an amber In-use badge.
+  const [inUse, setInUse] = useState<Record<string, string>>({});
   const startStop = async (p: ProfileMeta) => {
     if (!running[p.id] && profileSyncLocked(p.id)) { toast.info(syncLockMessage); return; }
     if (running[p.id]) {
@@ -1262,10 +1285,16 @@ function BrowsersView() {
     setStartBusy((s) => new Set([...s, p.id]));
     try {
       await invoke<number>("launch", { profileId: p.id });
+      // Launch succeeded → clear any stale in-use marker for this profile.
+      setInUse((m) => { if (!(p.id in m)) return m; const n = { ...m }; delete n[p.id]; return n; });
       // Don't optimistically flip `running` here; the 2s poll above picks
       // up the new child immediately and anchors the uptime clock.
     } catch (e) {
-      toast.err(String(e));
+      const msg = String(e);
+      toast.err(msg);
+      // Backend blocks launch when the profile is leased by another device.
+      const m = msg.match(/open on another device \(([^)]*)\)/);
+      if (m) setInUse((prev) => ({ ...prev, [p.id]: m[1] }));
     } finally {
       setStartBusy((s) => {
         const n = new Set(s);
@@ -1751,10 +1780,17 @@ function BrowsersView() {
                   <div className="name-sub">{p.id.slice(0, 8)}</div>
                 </div>
                 <div>
-                  <span className={`pill-status ${isRunning ? "ps-on" : isSyncLocked ? "ps-sync" : "ps-off"}`}>
-                    <i className="dot" />
-                    {isRunning ? "Running" : isSyncLocked ? "Syncing…" : "Idle"}
-                  </span>
+                  {!isRunning && !isSyncLocked && inUse[p.id] ? (
+                    <span className="pill-status ps-inuse" title={`Open on device ${inUse[p.id]}`}>
+                      <i className="dot" />
+                      In use ({inUse[p.id]})
+                    </span>
+                  ) : (
+                    <span className={`pill-status ${isRunning ? "ps-on" : isSyncLocked ? "ps-sync" : "ps-off"}`}>
+                      <i className="dot" />
+                      {isRunning ? "Running" : isSyncLocked ? "Syncing…" : "Idle"}
+                    </span>
+                  )}
                 </div>
                 <div className="cell-click" onClick={() => !isSyncLocked && setQuickEdit({ kind: "proxy", profile: p })} title={isSyncLocked ? syncLockMessage : "Change proxy"}>
                   {px ? (
@@ -1798,6 +1834,8 @@ function BrowsersView() {
                   >
                     {isRunning ? (
                       <><span className="btn-launch-ico"><Icon.Stop size={10} /></span><span>Stop</span></>
+                    ) : isSyncLocked && syncRuntime.phase === "pull_before_launch" ? (
+                      <><span className="btn-launch-ico spin"><ShardMini /></span><span>Loading profile…</span></>
                     ) : isSyncLocked ? (
                       <><span className="btn-launch-ico spin"><ShardMini /></span><span>Syncing…</span></>
                     ) : startBusy.has(p.id) ? (
@@ -5010,6 +5048,9 @@ function SettingsView() {
     sync_device_id: "",
     sync_last_cursor: null,
     sync_include_cookies: false,
+    sync_pull_on_start: true,
+    sync_auto_push_secs: 300,
+    sync_device_label: null,
   });
   const [api, setApi] = useState<ApiInfo | null>(null);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
@@ -5184,6 +5225,32 @@ function SettingsView() {
             onChange={(e) => setS({ ...s, sync_include_cookies: e.target.checked })}
           />
           <span className="lbl">Include cookies/session login state</span>
+        </label>
+        <label className="row-inline">
+          <input
+            type="checkbox"
+            checked={s.sync_pull_on_start ?? true}
+            onChange={(e) => setS({ ...s, sync_pull_on_start: e.target.checked })}
+          />
+          <span className="lbl">Pull latest on Start (download newest profile before launch)</span>
+        </label>
+        <label>
+          <span className="lbl">Auto-push every (seconds, 0 = off)</span>
+          <input
+            type="number"
+            min={0}
+            value={s.sync_auto_push_secs ?? 300}
+            onChange={(e) => setS({ ...s, sync_auto_push_secs: Math.max(0, Number(e.target.value) || 0) })}
+          />
+        </label>
+        <label>
+          <span className="lbl">Device label (shown to other devices when in use)</span>
+          <input
+            type="text"
+            value={s.sync_device_label ?? ""}
+            onChange={(e) => setS({ ...s, sync_device_label: e.target.value || null })}
+            placeholder="e.g. Work laptop"
+          />
         </label>
         <label>
           <span className="lbl">Device ID</span>

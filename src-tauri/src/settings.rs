@@ -47,6 +47,24 @@ pub struct Settings {
     pub sync_last_cursor: Option<String>,
     #[serde(default)]
     pub sync_include_cookies: bool,
+    /// Pull the latest profile bundle from the server on Start before
+    /// spawning (premium "pull-before-Start" behaviour). Default on.
+    #[serde(default = "default_true")]
+    pub sync_pull_on_start: bool,
+    /// Auto-push interval in seconds while idle (0 = off). Default 300.
+    #[serde(default = "default_auto_push_secs")]
+    pub sync_auto_push_secs: u32,
+    /// Human label for this device, shown in other devices' "In use" badge.
+    #[serde(default)]
+    pub sync_device_label: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_auto_push_secs() -> u32 {
+    300
 }
 
 fn default_theme() -> String {
@@ -83,6 +101,9 @@ pub fn load() -> Result<Settings> {
             sync_device_id: String::new(),
             sync_last_cursor: None,
             sync_include_cookies: false,
+            sync_pull_on_start: true,
+            sync_auto_push_secs: default_auto_push_secs(),
+            sync_device_label: None,
         });
     }
     let body = fs::read_to_string(&path)?;

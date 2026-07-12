@@ -561,121 +561,314 @@ fn apply_remote(items: &[SyncItem]) -> Result<(usize, usize)> {
     let mut applied = 0;
     let mut skipped = 0;
     for item in items {
-        // Remote deletion: apply it locally so a profile/proxy/fingerprint
-        // removed on another device disappears here too.  cookies/storage
-        // tombstones are meaningless on their own (they follow the profile),
-        // so only act on the top-level kinds.
-        if let Some(deleted_at) = item.deleted_at.as_ref() {
-            // Persist the server's tombstone locally (marker preserved, already
-            // pushed) so a later live echo of the same item can't resurrect it.
-            let remember = |kind: &str| record_tombstone_at(kind, &item.id, deleted_at, true);
-            match item.kind.as_str() {
-                "profile" => {
-                    if process::Tracker::shared().is_running(&item.id) {
-                        skipped += 1;
-                        continue;
-                    }
-                    let _ = profile::delete(&item.id);
-                    remember("profile")?;
-                    applied += 1;
-                }
-                "proxy" => {
-                    let _ = proxy::delete(&item.id);
-                    remember("proxy")?;
-                    applied += 1;
-                }
-                "fingerprint" => {
-                    let _ = fingerprints::delete(&item.id);
-                    remember("fingerprint")?;
-                    applied += 1;
-                }
-                _ => skipped += 1,
-            }
-            continue;
-        }
-        // A live upsert arrived.  If we hold a tombstone at least as new as
-        // this item, our delete wins LWW — skip the resurrection.
-        if tombstoned_after(&item.kind, &item.id, &item.updated_at) {
+        if apply_one(item)? {
+            applied += 1;
+        } else {
             skipped += 1;
-            continue;
-        }
-        match item.kind.as_str() {
-            "profile" => {
-                let mut stored: profile::StoredProfile = serde_json::from_value(item.payload.clone())?;
-                if stored.meta.id.is_empty() {
-                    stored.meta.id = item.id.clone();
-                }
-                if process::Tracker::shared().is_running(&stored.meta.id) {
-                    skipped += 1;
-                    continue;
-                }
-                profile::save_raw(&mut stored)?;
-                clear_tombstone("profile", &stored.meta.id)?;
-                applied += 1;
-            }
-            "proxy" => {
-                let p: proxy::ProxyEntry = serde_json::from_value(item.payload.clone())?;
-                let pid = p.id.clone();
-                proxy::upsert(p)?;
-                clear_tombstone("proxy", &pid)?;
-                applied += 1;
-            }
-            "proxies" => {
-                let store_val: proxy::ProxyStore = serde_json::from_value(item.payload.clone())?;
-                for p in store_val.proxies {
-                    proxy::upsert(p)?;
-                }
-                applied += 1;
-            }
-            "fingerprint" => {
-                let entry: fingerprints::LibraryEntry = serde_json::from_value(item.payload.clone())?;
-                let path = store::fingerprints_dir()?.join(format!("{}.json", entry.id));
-                let fid = entry.id.clone();
-                fs::write(path, serde_json::to_string_pretty(&entry)?)?;
-                clear_tombstone("fingerprint", &fid)?;
-                applied += 1;
-            }
-            "cookies" => {
-                let profile_id = item
-                    .payload
-                    .get("profile_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&item.id);
-                if process::Tracker::shared().is_running(profile_id) {
-                    skipped += 1;
-                    continue;
-                }
-                let cookies = item
-                    .payload
-                    .get("cookies")
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
-                let cookies: Vec<cookies::Cookie> = serde_json::from_value(cookies)?;
-                cookies::import(profile_id, &cookies)?;
-                applied += 1;
-            }
-            "storage_bundle" => {
-                let profile_id = item
-                    .payload
-                    .get("profile_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&item.id);
-                if process::Tracker::shared().is_running(profile_id) {
-                    skipped += 1;
-                    continue;
-                }
-                let Some(s) = item.payload.get("bytes").and_then(|v| v.as_str()) else {
-                    skipped += 1;
-                    continue;
-                };
-                let bytes = B64.decode(s)?;
-                import_storage_bundle(profile_id, &bytes)?;
-                applied += 1;
-            }
-            _ => skipped += 1,
         }
     }
     Ok((applied, skipped))
+}
+
+/// Apply a single remote item (upsert or tombstone) to local state.
+/// Returns `Ok(true)` when the item changed local state, `Ok(false)` when it
+/// was skipped (running profile, stale vs. tombstone, unknown kind).  Shared
+/// by the full `apply_remote` pull and the per-profile `pull_profile`.
+fn apply_one(item: &SyncItem) -> Result<bool> {
+    // Remote deletion: apply it locally so a profile/proxy/fingerprint
+    // removed on another device disappears here too.  cookies/storage
+    // tombstones are meaningless on their own (they follow the profile),
+    // so only act on the top-level kinds.
+    if let Some(deleted_at) = item.deleted_at.as_ref() {
+        // Persist the server's tombstone locally (marker preserved, already
+        // pushed) so a later live echo of the same item can't resurrect it.
+        let remember = |kind: &str| record_tombstone_at(kind, &item.id, deleted_at, true);
+        return match item.kind.as_str() {
+            "profile" => {
+                if process::Tracker::shared().is_running(&item.id) {
+                    return Ok(false);
+                }
+                let _ = profile::delete(&item.id);
+                remember("profile")?;
+                Ok(true)
+            }
+            "proxy" => {
+                let _ = proxy::delete(&item.id);
+                remember("proxy")?;
+                Ok(true)
+            }
+            "fingerprint" => {
+                let _ = fingerprints::delete(&item.id);
+                remember("fingerprint")?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        };
+    }
+    // A live upsert arrived.  If we hold a tombstone at least as new as
+    // this item, our delete wins LWW — skip the resurrection.
+    if tombstoned_after(&item.kind, &item.id, &item.updated_at) {
+        return Ok(false);
+    }
+    match item.kind.as_str() {
+        "profile" => {
+            let mut stored: profile::StoredProfile = serde_json::from_value(item.payload.clone())?;
+            if stored.meta.id.is_empty() {
+                stored.meta.id = item.id.clone();
+            }
+            if process::Tracker::shared().is_running(&stored.meta.id) {
+                return Ok(false);
+            }
+            profile::save_raw(&mut stored)?;
+            clear_tombstone("profile", &stored.meta.id)?;
+            Ok(true)
+        }
+        "proxy" => {
+            let p: proxy::ProxyEntry = serde_json::from_value(item.payload.clone())?;
+            let pid = p.id.clone();
+            proxy::upsert(p)?;
+            clear_tombstone("proxy", &pid)?;
+            Ok(true)
+        }
+        "proxies" => {
+            let store_val: proxy::ProxyStore = serde_json::from_value(item.payload.clone())?;
+            for p in store_val.proxies {
+                proxy::upsert(p)?;
+            }
+            Ok(true)
+        }
+        "fingerprint" => {
+            let entry: fingerprints::LibraryEntry = serde_json::from_value(item.payload.clone())?;
+            let path = store::fingerprints_dir()?.join(format!("{}.json", entry.id));
+            let fid = entry.id.clone();
+            fs::write(path, serde_json::to_string_pretty(&entry)?)?;
+            clear_tombstone("fingerprint", &fid)?;
+            Ok(true)
+        }
+        "cookies" => {
+            let profile_id = item
+                .payload
+                .get("profile_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&item.id);
+            if process::Tracker::shared().is_running(profile_id) {
+                return Ok(false);
+            }
+            let cookies = item
+                .payload
+                .get("cookies")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let cookies: Vec<cookies::Cookie> = serde_json::from_value(cookies)?;
+            cookies::import(profile_id, &cookies)?;
+            Ok(true)
+        }
+        "storage_bundle" => {
+            let profile_id = item
+                .payload
+                .get("profile_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&item.id);
+            if process::Tracker::shared().is_running(profile_id) {
+                return Ok(false);
+            }
+            let Some(s) = item.payload.get("bytes").and_then(|v| v.as_str()) else {
+                return Ok(false);
+            };
+            let bytes = B64.decode(s)?;
+            import_storage_bundle(profile_id, &bytes)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PullReport {
+    pub applied: usize,
+    pub skipped: usize,
+    pub missing: usize,
+}
+
+/// Fetch the latest server copy of a single profile's bundle (config +
+/// cookies + storage) and apply it before launch — the "pull-before-Start"
+/// behaviour of premium antidetect browsers, so the newest login from another
+/// device is reconstructed locally before the browser spawns.
+///
+/// Robust offline: a network/server failure returns Err; the caller (launch)
+/// warns but still launches from local data.  A profile that is currently
+/// running locally is left untouched (never clobber a live session).
+pub async fn pull_profile(profile_id: &str) -> Result<PullReport> {
+    if process::Tracker::shared().is_running(profile_id) {
+        // Live session — nothing to pull, the local copy is the newest.
+        return Ok(PullReport::default());
+    }
+    let s = configured()?;
+    let base = clean_base_url(s.sync_base_url.as_deref().unwrap_or(""))?;
+
+    begin_sync("pull_before_launch", Some(profile_id.to_string()), "Loading profile from cloud")?;
+    let result = pull_profile_inner(&s, &base, profile_id).await;
+    match &result {
+        Ok(r) => finish_sync(
+            None,
+            &format!("Loaded profile (applied {}, skipped {})", r.applied, r.skipped),
+        ),
+        Err(e) => finish_sync(None, &format!("Pull failed: {e}")),
+    }
+    // finish_sync marks phase error when no report; overwrite phase to done on
+    // success so the UI banner doesn't read as a failure.
+    if result.is_ok() {
+        if let Ok(mut st) = runtime_state().lock() {
+            st.phase = "done".into();
+            emit_status(&st);
+        }
+    }
+    result
+}
+
+async fn pull_profile_inner(
+    s: &settings::Settings,
+    base: &str,
+    profile_id: &str,
+) -> Result<PullReport> {
+    update_sync("pulling_profile", "Fetching latest profile data");
+    let c = client();
+    let mut report = PullReport::default();
+    // Pull the profile config first, then cookies, then the storage bundle.
+    // All three are keyed by profile_id on the server.
+    for kind in ["profile", "cookies", "storage_bundle"] {
+        let url = format!("{base}/sync/item/{kind}/{profile_id}");
+        let res = auth(c.get(url), &s.sync_token).send().await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            report.missing += 1;
+            continue;
+        }
+        let res = res.error_for_status()?;
+        let item = res.json::<SyncItem>().await?;
+        update_sync("applying", &format!("Applying {kind}"));
+        if apply_one(&item)? {
+            report.applied += 1;
+        } else {
+            report.skipped += 1;
+        }
+    }
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Device lease: a TTL-based "in use" lock so two devices don't overwrite each
+// other's cookies.  Held while a profile is open; refreshed by a heartbeat.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LeaseState {
+    /// True if *we* currently hold the lease.
+    pub held_by_me: bool,
+    /// True if the profile is free (no active holder).
+    pub free: bool,
+    /// Device id of the current holder (empty when free).
+    #[serde(default)]
+    pub holder_device: String,
+    /// Human label of the holder, if the holder set one.
+    #[serde(default)]
+    pub holder_label: Option<String>,
+    /// Unix seconds when the current lease expires (0 when free).
+    #[serde(default)]
+    pub expires_at: u64,
+}
+
+const LEASE_TTL_SECS: u64 = 180;
+
+/// Try to acquire (or refresh) the lease for a profile.  Returns the resulting
+/// lease state.  On a 409 conflict (held by another live device) returns a
+/// state with `held_by_me=false` and the holder's identity so the caller can
+/// block the launch.
+pub async fn acquire_lease(profile_id: &str) -> Result<LeaseState> {
+    let s = configured()?;
+    let base = clean_base_url(s.sync_base_url.as_deref().unwrap_or(""))?;
+    let c = client();
+    let body = json!({
+        "device_id": s.sync_device_id,
+        "device_label": s.sync_device_label,
+        "ttl_secs": LEASE_TTL_SECS,
+    });
+    let res = auth(c.post(format!("{base}/lease/{profile_id}")), &s.sync_token)
+        .json(&body)
+        .send()
+        .await?;
+    if res.status() == reqwest::StatusCode::CONFLICT {
+        let v = res.json::<Value>().await.unwrap_or_default();
+        return Ok(LeaseState {
+            held_by_me: false,
+            free: false,
+            holder_device: v.get("holder_device").and_then(|x| x.as_str()).unwrap_or("").into(),
+            holder_label: v.get("holder_label").and_then(|x| x.as_str()).map(String::from),
+            expires_at: v.get("expires_at").and_then(|x| x.as_u64()).unwrap_or(0),
+        });
+    }
+    let v = res.error_for_status()?.json::<Value>().await.unwrap_or_default();
+    Ok(LeaseState {
+        held_by_me: v.get("held_by_me").and_then(|x| x.as_bool()).unwrap_or(true),
+        free: false,
+        holder_device: v.get("holder_device").and_then(|x| x.as_str()).unwrap_or("").into(),
+        holder_label: v.get("holder_label").and_then(|x| x.as_str()).map(String::from),
+        expires_at: v.get("expires_at").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
+}
+
+/// Release a lease we hold.  Best-effort: errors are ignored (the TTL will
+/// expire it anyway).
+pub async fn release_lease(profile_id: &str) {
+    let Ok(s) = configured() else { return };
+    let Ok(base) = clean_base_url(s.sync_base_url.as_deref().unwrap_or("")) else {
+        return;
+    };
+    let c = client();
+    let body = json!({ "device_id": s.sync_device_id });
+    let _ = auth(c.delete(format!("{base}/lease/{profile_id}")), &s.sync_token)
+        .json(&body)
+        .send()
+        .await;
+}
+
+/// Read the current lease holder for a profile (UI "In use elsewhere" badge).
+pub async fn lease_status(profile_id: &str) -> Result<LeaseState> {
+    let s = configured()?;
+    let base = clean_base_url(s.sync_base_url.as_deref().unwrap_or(""))?;
+    let c = client();
+    let v = auth(c.get(format!("{base}/lease/{profile_id}")), &s.sync_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    if v.get("free").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return Ok(LeaseState { free: true, ..Default::default() });
+    }
+    let holder = v.get("holder_device").and_then(|x| x.as_str()).unwrap_or("");
+    Ok(LeaseState {
+        held_by_me: holder == s.sync_device_id,
+        free: false,
+        holder_device: holder.into(),
+        holder_label: v.get("holder_label").and_then(|x| x.as_str()).map(String::from),
+        expires_at: v.get("expires_at").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
+}
+
+/// Periodic auto-push tick: if sync is enabled and idle, run a normal
+/// push+pull so changes reach other devices without waiting for close.
+/// Called from a timer in lib.rs.  Silently no-ops when disabled or busy.
+pub async fn sync_periodic_tick() {
+    let Ok(s) = settings::load() else { return };
+    if !s.sync_enabled || s.sync_base_url.as_deref().unwrap_or("").is_empty() || s.sync_token.is_empty() {
+        return;
+    }
+    if is_active() {
+        return;
+    }
+    if let Err(e) = run_sync("auto", None, "Auto-syncing").await {
+        eprintln!("[sync] periodic tick failed: {e}");
+    }
 }
 
 fn storage_updated_at(profile_id: &str) -> Result<String> {

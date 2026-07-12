@@ -865,11 +865,61 @@ fn proxy_bulk_save(entries: Vec<proxy::ProxyEntry>) -> Result<usize, String> {
 #[tauri::command]
 async fn launch(profile_id: String) -> Result<u32, String> {
     ensure_profile_not_syncing(&profile_id)?;
+
+    // Premium pull-before-Start: download the newest profile bundle (config +
+    // cookies + storage) from the server, reconstruct it locally, then spawn.
+    // Robust offline: a failure only warns — we still launch from local data.
+    let cfg = settings::load().ok();
+    let sync_on = cfg.as_ref().map(|s| s.sync_enabled).unwrap_or(false);
+    if sync_on && cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
+        match sync::pull_profile(&profile_id).await {
+            Ok(report) => {
+                if report.applied > 0 {
+                    notify_store_changed("profiles");
+                }
+            }
+            Err(e) => {
+                // Warn-then-launch: surface a toast but continue with local data.
+                if let Some(w) = main_window() {
+                    use tauri::Emitter;
+                    let _ = w.emit(
+                        "launch-warning",
+                        serde_json::json!({
+                            "profile_id": profile_id,
+                            "message": format!("Could not pull latest: {e}. Launching local copy."),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    // Device lease: block if the profile is open on another live device, so we
+    // don't overwrite its cookies.  Sync off / unreachable → skip silently.
+    if sync_on {
+        match sync::acquire_lease(&profile_id).await {
+            Ok(state) if !state.held_by_me && !state.free => {
+                let who = state
+                    .holder_label
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| state.holder_device.clone());
+                return Err(format!("profile is open on another device ({who})"));
+            }
+            _ => {}
+        }
+    }
+
     // UI launches: no CDP, headed.
     launch::launch_profile(&profile_id, false, false)
         .await
         .map(|o| o.pid)
         .map_err(|e| e.to_string())
+}
+
+/// Read the current lease holder for a profile (UI "In use elsewhere" badge).
+#[tauri::command]
+async fn profile_lease_status(profile_id: String) -> Result<sync::LeaseState, String> {
+    sync::lease_status(&profile_id).await.map_err(|e| e.to_string())
 }
 
 // ---- Cookies ----
@@ -1294,6 +1344,7 @@ pub fn run() {
             sync_runtime_status,
             sync_test,
             sync_now,
+            profile_lease_status,
             sync_export_storage_bundle,
             sync_import_storage_bundle,
             ps_get_key,
@@ -1388,6 +1439,28 @@ pub fn run() {
                 notify_store_changed("profiles");
                 notify_store_changed("proxies");
                 notify_store_changed("fingerprints");
+            });
+
+            // Periodic auto-push: while idle, push+pull on an interval so other
+            // devices see changes without waiting for the profile to close.
+            tauri::async_runtime::spawn(async {
+                loop {
+                    let secs = settings::load()
+                        .ok()
+                        .map(|s| s.sync_auto_push_secs)
+                        .unwrap_or(300);
+                    // 0 disables auto-push; still poll the setting every 60s so
+                    // a toggle takes effect without a restart.
+                    let wait = if secs == 0 { 60 } else { secs.max(30) as u64 };
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    if secs == 0 {
+                        continue;
+                    }
+                    sync::sync_periodic_tick().await;
+                    notify_store_changed("profiles");
+                    notify_store_changed("proxies");
+                    notify_store_changed("fingerprints");
+                }
             });
 
             // API task on the shared tokio runtime.

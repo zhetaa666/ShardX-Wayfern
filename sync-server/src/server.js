@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS object_refs (
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   PRIMARY KEY (workspace_id, profile_id, revision)
 );
+CREATE TABLE IF NOT EXISTS leases (
+  workspace_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  device_label TEXT,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (workspace_id, profile_id)
+);
 `);
 
 const upsertItem = db.prepare(`
@@ -83,6 +91,16 @@ VALUES(?, ?, ?, ?, ?, ?)
 const objectLatest = db.prepare(`
 SELECT * FROM object_refs WHERE workspace_id = ? AND profile_id = ? ORDER BY revision DESC LIMIT 1
 `);
+const leaseGet = db.prepare('SELECT * FROM leases WHERE workspace_id = ? AND profile_id = ?');
+const leaseUpsert = db.prepare(`
+INSERT INTO leases(workspace_id, profile_id, device_id, device_label, expires_at)
+VALUES(@workspace_id, @profile_id, @device_id, @device_label, @expires_at)
+ON CONFLICT(workspace_id, profile_id) DO UPDATE SET
+  device_id=excluded.device_id,
+  device_label=excluded.device_label,
+  expires_at=excluded.expires_at
+`);
+const leaseDelete = db.prepare('DELETE FROM leases WHERE workspace_id = ? AND profile_id = ? AND device_id = ?');
 
 const minio = env('MINIO_ENDPOINT')
   ? new MinioClient({
@@ -218,6 +236,60 @@ app.get('/storage/:profileId/latest', { preHandler: auth }, async (req, reply) =
   if (!row) return reply.code(404).send({ error: 'not found' });
   const url = await minio.presignedGetObject(BUCKET, row.object_key, 60 * 10);
   return { profile_id: req.params.profileId, revision: row.revision, checksum: row.checksum, size_bytes: row.size_bytes, url };
+});
+
+// Device lease: TTL-based "in use" lock so two devices don't overwrite each
+// other's cookies. A lease is free when absent or expired (expires_at <= now).
+app.post('/lease/:profileId', { preHandler: auth }, async (req, reply) => {
+  const profileId = String(req.params.profileId);
+  const deviceId = String(req.body?.device_id || '').trim();
+  if (!deviceId) return reply.code(400).send({ error: 'missing device_id' });
+  const deviceLabel = req.body?.device_label ? String(req.body.device_label) : null;
+  const ttl = Math.min(Math.max(Number(req.body?.ttl_secs || 180), 30), 3600);
+  const now = Math.floor(Date.now() / 1000);
+  const existing = leaseGet.get(WORKSPACE_ID, profileId);
+  const active = existing && existing.expires_at > now && existing.device_id !== deviceId;
+  if (active) {
+    return reply.code(409).send({
+      ok: false,
+      held_by_me: false,
+      holder_device: existing.device_id,
+      holder_label: existing.device_label,
+      expires_at: existing.expires_at,
+    });
+  }
+  const expiresAt = now + ttl;
+  leaseUpsert.run({
+    workspace_id: WORKSPACE_ID,
+    profile_id: profileId,
+    device_id: deviceId,
+    device_label: deviceLabel,
+    expires_at: expiresAt,
+  });
+  return { ok: true, held_by_me: true, holder_device: deviceId, holder_label: deviceLabel, expires_at: expiresAt };
+});
+
+app.delete('/lease/:profileId', { preHandler: auth }, async (req, reply) => {
+  const profileId = String(req.params.profileId);
+  const deviceId = String(req.body?.device_id || '').trim();
+  if (!deviceId) return reply.code(400).send({ error: 'missing device_id' });
+  leaseDelete.run(WORKSPACE_ID, profileId, deviceId);
+  return { ok: true };
+});
+
+app.get('/lease/:profileId', { preHandler: auth }, async (req) => {
+  const profileId = String(req.params.profileId);
+  const now = Math.floor(Date.now() / 1000);
+  const existing = leaseGet.get(WORKSPACE_ID, profileId);
+  if (!existing || existing.expires_at <= now) {
+    return { free: true };
+  }
+  return {
+    free: false,
+    holder_device: existing.device_id,
+    holder_label: existing.device_label,
+    expires_at: existing.expires_at,
+  };
 });
 
 await ensureBucket();

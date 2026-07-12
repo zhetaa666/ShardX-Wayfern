@@ -48,6 +48,23 @@ impl Tracker {
             );
         }
 
+        // Lease heartbeat: while a real (non-temporary) profile is open, keep
+        // its cloud lease fresh so other devices see it as "in use".  The loop
+        // exits once the profile is no longer tracked (i.e. it has closed).
+        if !temporary {
+            let hb_id = profile_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    if !Self::shared().is_running(&hb_id) {
+                        break;
+                    }
+                    // Ignore errors: sync may be off/unreachable, TTL covers gaps.
+                    let _ = crate::sync::acquire_lease(&hb_id).await;
+                }
+            });
+        }
+
         // Graceful shutdown (SIGTERM / taskkill WM_CLOSE) → 5s → hard kill.
         // Graceful path flushes session state so next launch skips the restore prompt.
         let started_at = Instant::now();
@@ -98,6 +115,9 @@ impl Tracker {
                 }
                 let sync_profile_id = profile_id.clone();
                 tokio::spawn(async move {
+                    // Release our lease first so another device can Start this
+                    // profile immediately, then push the closed session's data.
+                    crate::sync::release_lease(&sync_profile_id).await;
                     crate::sync::sync_after_profile_close(sync_profile_id).await;
                 });
             }
