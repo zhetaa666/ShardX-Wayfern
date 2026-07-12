@@ -389,10 +389,12 @@ pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
     Ok(n)
 }
 
-/// Delete folder; `delete_profiles` true removes, false unfiles. Returns count.
-pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
+/// Delete folder; `delete_profiles` true removes, false unfiles.  Returns the
+/// affected profile ids (deleted or unfiled); callers use `.len()` for the
+/// count and, when deleting, record a sync tombstone per id.
+pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<Vec<String>> {
     let dir = store::profiles_dir()?;
-    let mut n = 0;
+    let mut affected = Vec::new();
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
@@ -404,18 +406,19 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
             continue;
         };
         if stored.meta.folder == name {
+            let id = stored.meta.id.clone();
             if delete_profiles {
-                let _ = delete(&stored.meta.id);
+                let _ = delete(&id);
             } else {
                 stored.meta.folder = String::new();
                 if let Ok(out) = serde_json::to_string_pretty(&stored) {
                     let _ = fs::write(entry.path(), out);
                 }
             }
-            n += 1;
+            affected.push(id);
         }
     }
-    Ok(n)
+    Ok(affected)
 }
 
 /// Per-profile user-data-dir; created on first call.

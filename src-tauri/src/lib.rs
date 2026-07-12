@@ -480,7 +480,10 @@ pub fn save_profile_core(
 #[tauri::command]
 fn profile_delete(id: String) -> Result<(), String> {
     ensure_profile_not_syncing(&id)?;
-    profile::delete(&id).map_err(|e| e.to_string())
+    profile::delete(&id).map_err(|e| e.to_string())?;
+    // Tombstone so the deletion propagates to other devices on next sync.
+    let _ = sync::record_tombstone("profile", &id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -558,7 +561,13 @@ fn folder_delete(folder: String, delete_profiles: bool) -> Result<usize, String>
     if delete_profiles {
         ensure_sync_idle()?;
     }
-    profile::delete_folder(&folder, delete_profiles).map_err(|e| e.to_string())
+    let affected = profile::delete_folder(&folder, delete_profiles).map_err(|e| e.to_string())?;
+    if delete_profiles {
+        for id in &affected {
+            let _ = sync::record_tombstone("profile", id);
+        }
+    }
+    Ok(affected.len())
 }
 
 /// Host OS in fingerprint-library vocabulary (macOS/Windows/Linux).
@@ -734,7 +743,9 @@ fn fingerprint_import(json_text: String, id_hint: Option<String>) -> Result<fing
 #[tauri::command]
 fn fingerprint_delete(id: String) -> Result<(), String> {
     ensure_sync_idle()?;
-    fingerprints::delete(&id).map_err(|e| e.to_string())
+    fingerprints::delete(&id).map_err(|e| e.to_string())?;
+    let _ = sync::record_tombstone("fingerprint", &id);
+    Ok(())
 }
 
 /// Path to fingerprint library dir (UI "Open library folder").
@@ -784,7 +795,9 @@ fn proxy_save(entry: proxy::ProxyEntry) -> Result<proxy::ProxyEntry, String> {
 #[tauri::command]
 fn proxy_delete(id: String) -> Result<(), String> {
     ensure_sync_idle()?;
-    proxy::delete(&id).map_err(|e| e.to_string())
+    proxy::delete(&id).map_err(|e| e.to_string())?;
+    let _ = sync::record_tombstone("proxy", &id);
+    Ok(())
 }
 
 #[tauri::command]

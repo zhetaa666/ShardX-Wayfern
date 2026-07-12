@@ -290,6 +290,7 @@ async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
 
 async fn delete_profile(Path(id): Path<String>) -> ApiResult {
     crate::profile::delete(&id).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = crate::sync::record_tombstone("profile", &id);
     crate::notify_store_changed("profiles");
     Ok(Json(json!({ "deleted": true, "id": id })))
 }
@@ -375,13 +376,18 @@ struct DeleteFolderQuery {
 }
 
 async fn delete_folder_ep(Path(folder): Path<String>, Query(q): Query<DeleteFolderQuery>) -> ApiResult {
-    let n = crate::profile::delete_folder(&folder, q.delete_profiles)
+    let affected = crate::profile::delete_folder(&folder, q.delete_profiles)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if q.delete_profiles {
+        for id in &affected {
+            let _ = crate::sync::record_tombstone("profile", id);
+        }
+    }
     crate::notify_store_changed("profiles");
     Ok(Json(json!({
         "deleted_folder": folder,
         "delete_profiles": q.delete_profiles,
-        "profiles": n,
+        "profiles": affected.len(),
     })))
 }
 
@@ -530,6 +536,7 @@ async fn add_proxy(Json(body): Json<AddProxyReq>) -> ApiResult {
 
 async fn delete_proxy(Path(id): Path<String>) -> ApiResult {
     crate::proxy::delete(&id).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = crate::sync::record_tombstone("proxy", &id);
     crate::notify_store_changed("proxies");
     Ok(Json(json!({ "deleted": true, "id": id })))
 }

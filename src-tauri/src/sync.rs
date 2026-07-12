@@ -30,6 +30,144 @@ pub struct SyncBatch {
     pub cursor: Option<String>,
 }
 
+/// Local record of a deleted item so the deletion propagates to other
+/// devices.  Chromium-style antidetect browsers sync deletes just like
+/// edits: without this a profile removed on device A silently reappears
+/// from device B's push.  We keep the tombstone until it has been pushed
+/// *and* the pull cursor has advanced past our own echo, then purge it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub kind: String,
+    pub id: String,
+    /// "@<unix_secs>" delete marker; drives last-write-wins on the server.
+    pub deleted_at: String,
+    /// Whether this tombstone has been sent to the server at least once.
+    #[serde(default)]
+    pub pushed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TombstoneStore {
+    #[serde(default)]
+    items: Vec<Tombstone>,
+}
+
+fn tombstones_path() -> Result<PathBuf> {
+    Ok(store::config_root()?.join("tombstones.json"))
+}
+
+fn load_tombstones() -> Result<TombstoneStore> {
+    let path = tombstones_path()?;
+    if !path.exists() {
+        return Ok(TombstoneStore::default());
+    }
+    let body = fs::read_to_string(&path)?;
+    Ok(serde_json::from_str(&body).unwrap_or_default())
+}
+
+fn save_tombstones(s: &TombstoneStore) -> Result<()> {
+    fs::write(tombstones_path()?, serde_json::to_string_pretty(s)?)?;
+    Ok(())
+}
+
+/// Record (or refresh) a tombstone for a locally deleted item.  Called by
+/// the delete commands so the next sync pushes the deletion outward.
+pub fn record_tombstone(kind: &str, id: &str) -> Result<()> {
+    record_tombstone_at(kind, id, &now_marker(), false)
+}
+
+/// Lower-level tombstone writer.  `pushed=true` (used when we received the
+/// delete from the server) keeps the original marker and suppresses a
+/// pointless re-push; the local-delete path uses a fresh marker + false.
+fn record_tombstone_at(kind: &str, id: &str, marker: &str, pushed: bool) -> Result<()> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    let mut s = load_tombstones()?;
+    if let Some(t) = s.items.iter_mut().find(|t| t.kind == kind && t.id == id) {
+        // Keep the newest marker; only downgrade `pushed` for local deletes.
+        if marker >= t.deleted_at.as_str() {
+            t.deleted_at = marker.to_string();
+        }
+        if !pushed {
+            t.pushed = false;
+        }
+    } else {
+        s.items.push(Tombstone {
+            kind: kind.into(),
+            id: id.into(),
+            deleted_at: marker.to_string(),
+            pushed,
+        });
+    }
+    save_tombstones(&s)
+}
+
+/// Drop a tombstone once the item is recreated locally (e.g. a remote
+/// upsert wins LWW), so a stale delete can't wipe the fresh copy.
+fn clear_tombstone(kind: &str, id: &str) -> Result<()> {
+    let mut s = load_tombstones()?;
+    let before = s.items.len();
+    s.items.retain(|t| !(t.kind == kind && t.id == id));
+    if s.items.len() != before {
+        save_tombstones(&s)?;
+    }
+    Ok(())
+}
+
+/// True if a tombstone for (kind,id) is newer than `marker` — used so a
+/// remote upsert we already deleted locally doesn't resurrect the item.
+fn tombstoned_after(kind: &str, id: &str, marker: &str) -> bool {
+    load_tombstones()
+        .ok()
+        .map(|s| {
+            s.items
+                .iter()
+                .any(|t| t.kind == kind && t.id == id && t.deleted_at.as_str() >= marker)
+        })
+        .unwrap_or(false)
+}
+
+/// Mark every tombstone as pushed after a successful `/sync/push`.  Once
+/// pushed, they stay until the item's own upsert is confirmed gone from
+/// incoming changes; we simply purge pushed tombstones older than a grace
+/// window so the file can't grow forever.
+fn mark_tombstones_pushed() -> Result<()> {
+    let mut s = load_tombstones()?;
+    if s.items.is_empty() {
+        return Ok(());
+    }
+    let cutoff = unix_now().saturating_sub(TOMBSTONE_TTL_SECS);
+    let mut changed = false;
+    for t in s.items.iter_mut() {
+        if !t.pushed {
+            t.pushed = true;
+            changed = true;
+        }
+    }
+    // Purge pushed tombstones older than the TTL: by then every device has
+    // pulled the delete, and the server keeps its own copy for late joiners.
+    let before = s.items.len();
+    s.items.retain(|t| {
+        let secs = t
+            .deleted_at
+            .strip_prefix('@')
+            .and_then(|d| d.parse::<u64>().ok())
+            .unwrap_or(0);
+        !(t.pushed && secs < cutoff)
+    });
+    if s.items.len() != before {
+        changed = true;
+    }
+    if changed {
+        save_tombstones(&s)?;
+    }
+    Ok(())
+}
+
+/// Grace window before a pushed tombstone is purged locally (7 days).
+const TOMBSTONE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncReport {
     pub pushed: usize,
@@ -297,6 +435,9 @@ async fn sync_inner() -> Result<SyncReport> {
         .send()
         .await?
         .error_for_status()?;
+    // Push succeeded: the server now owns our tombstones, so mark them
+    // pushed and purge any that have aged out of the grace window.
+    let _ = mark_tombstones_pushed();
 
     update_sync("pulling", "Pulling remote changes");
     let mut req = c.get(format!("{base}/sync/changes"));
@@ -392,6 +533,27 @@ fn collect_local(s: &settings::Settings) -> Result<Vec<SyncItem>> {
         });
     }
 
+    // Deletions: push a tombstone for every locally removed item so the
+    // delete wins last-write-wins on the server and reaches other devices.
+    // Only unpushed tombstones go out — re-pushing an already-stored one
+    // with an equal marker would bump the server seq and echo back forever,
+    // creating a two-device sync loop.  The server's normalizeItem rejects
+    // null payloads, so carry a minimal marker object instead.
+    for t in load_tombstones()?.items {
+        if t.pushed {
+            continue;
+        }
+        out.push(SyncItem {
+            kind: t.kind.clone(),
+            id: t.id.clone(),
+            updated_at: t.deleted_at.clone(),
+            deleted_at: Some(t.deleted_at.clone()),
+            device_id: device.clone(),
+            revision: 0,
+            payload: json!({ "deleted": true, "id": t.id }),
+        });
+    }
+
     Ok(out)
 }
 
@@ -399,7 +561,41 @@ fn apply_remote(items: &[SyncItem]) -> Result<(usize, usize)> {
     let mut applied = 0;
     let mut skipped = 0;
     for item in items {
-        if item.deleted_at.is_some() {
+        // Remote deletion: apply it locally so a profile/proxy/fingerprint
+        // removed on another device disappears here too.  cookies/storage
+        // tombstones are meaningless on their own (they follow the profile),
+        // so only act on the top-level kinds.
+        if let Some(deleted_at) = item.deleted_at.as_ref() {
+            // Persist the server's tombstone locally (marker preserved, already
+            // pushed) so a later live echo of the same item can't resurrect it.
+            let remember = |kind: &str| record_tombstone_at(kind, &item.id, deleted_at, true);
+            match item.kind.as_str() {
+                "profile" => {
+                    if process::Tracker::shared().is_running(&item.id) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let _ = profile::delete(&item.id);
+                    remember("profile")?;
+                    applied += 1;
+                }
+                "proxy" => {
+                    let _ = proxy::delete(&item.id);
+                    remember("proxy")?;
+                    applied += 1;
+                }
+                "fingerprint" => {
+                    let _ = fingerprints::delete(&item.id);
+                    remember("fingerprint")?;
+                    applied += 1;
+                }
+                _ => skipped += 1,
+            }
+            continue;
+        }
+        // A live upsert arrived.  If we hold a tombstone at least as new as
+        // this item, our delete wins LWW — skip the resurrection.
+        if tombstoned_after(&item.kind, &item.id, &item.updated_at) {
             skipped += 1;
             continue;
         }
@@ -414,11 +610,14 @@ fn apply_remote(items: &[SyncItem]) -> Result<(usize, usize)> {
                     continue;
                 }
                 profile::save_raw(&mut stored)?;
+                clear_tombstone("profile", &stored.meta.id)?;
                 applied += 1;
             }
             "proxy" => {
                 let p: proxy::ProxyEntry = serde_json::from_value(item.payload.clone())?;
+                let pid = p.id.clone();
                 proxy::upsert(p)?;
+                clear_tombstone("proxy", &pid)?;
                 applied += 1;
             }
             "proxies" => {
@@ -431,7 +630,9 @@ fn apply_remote(items: &[SyncItem]) -> Result<(usize, usize)> {
             "fingerprint" => {
                 let entry: fingerprints::LibraryEntry = serde_json::from_value(item.payload.clone())?;
                 let path = store::fingerprints_dir()?.join(format!("{}.json", entry.id));
+                let fid = entry.id.clone();
                 fs::write(path, serde_json::to_string_pretty(&entry)?)?;
+                clear_tombstone("fingerprint", &fid)?;
                 applied += 1;
             }
             "cookies" => {
