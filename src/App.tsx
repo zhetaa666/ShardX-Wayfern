@@ -280,12 +280,31 @@ type Settings = {
   api_enabled?: boolean;
   api_port?: number;
   api_secret?: string;
+  sync_enabled?: boolean;
+  sync_base_url?: string | null;
+  sync_token?: string;
+  sync_device_id?: string;
+  sync_last_cursor?: string | null;
+  sync_include_cookies?: boolean;
 };
 type ApiInfo = {
   enabled: boolean;
   port: number;
   base_url: string;
   token: string;
+};
+type SyncStatus = {
+  enabled: boolean;
+  base_url?: string | null;
+  device_id: string;
+  last_cursor?: string | null;
+  include_cookies: boolean;
+};
+type SyncReport = {
+  pushed: number;
+  pulled: number;
+  skipped: number;
+  cursor?: string | null;
 };
 type Section = "browsers" | "proxies" | "proxyshard" | "fingerprints" | "settings";
 
@@ -4917,10 +4936,22 @@ function SettingsView() {
     screen_resolution_mode: "fingerprint",
     api_enabled: true,
     api_port: 40325,
+    sync_enabled: false,
+    sync_base_url: null,
+    sync_token: "",
+    sync_device_id: "",
+    sync_last_cursor: null,
+    sync_include_cookies: false,
   });
   const [api, setApi] = useState<ApiInfo | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [syncBusy, setSyncBusy] = useState(false);
   const refreshApi = () => invoke<ApiInfo>("api_info").then(setApi).catch(() => {});
-  useEffect(() => { invoke<Settings>("settings_get").then(setS); refreshApi(); }, []);
+  const refreshSync = () => invoke<SyncStatus>("sync_status").then((st) => {
+    setSyncStatus(st);
+    setS((cur) => ({ ...cur, sync_device_id: st.device_id, sync_last_cursor: st.last_cursor ?? null }));
+  }).catch(() => {});
+  useEffect(() => { invoke<Settings>("settings_get").then(setS); refreshApi(); refreshSync(); }, []);
   const regenToken = async () => {
     try { setApi(await invoke<ApiInfo>("api_regenerate_token")); toast.ok("Token regenerated"); }
     catch (e) { toast.err(String(e)); }
@@ -4941,6 +4972,22 @@ function SettingsView() {
   const save = async () => {
     try { await invoke("settings_save", { value: s }); toast.ok("Settings saved"); }
     catch (e) { toast.err(String(e)); }
+  };
+  const syncTest = async () => {
+    try {
+      await invoke("sync_test", { baseUrl: s.sync_base_url || "", token: s.sync_token || "" });
+      toast.ok("Sync server reachable");
+    } catch (e) { toast.err(String(e)); }
+  };
+  const syncNow = async () => {
+    setSyncBusy(true);
+    try {
+      await invoke("settings_save", { value: s });
+      const r = await invoke<SyncReport>("sync_now");
+      refreshSync();
+      toast.ok(`Sync: pushed ${r.pushed}, pulled ${r.pulled}, skipped ${r.skipped}`);
+    } catch (e) { toast.err(String(e)); }
+    finally { setSyncBusy(false); }
   };
   return (
     <section className="page settings-page">
@@ -5030,6 +5077,62 @@ function SettingsView() {
             </p>
           </>
         )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3>Self-hosted sync</h3>
+        <p className="muted small">
+          Premium-style sync for profile config, proxies, fingerprint library, and cookies. LocalStorage/IndexedDB bundles are prepared backend-side for the next storage-object phase. Stop profiles before cookie/session sync.
+        </p>
+        <label className="row-inline">
+          <input
+            type="checkbox"
+            checked={s.sync_enabled ?? false}
+            onChange={(e) => setS({ ...s, sync_enabled: e.target.checked })}
+          />
+          <span className="lbl">Enable sync client</span>
+        </label>
+        <label>
+          <span className="lbl">Server URL</span>
+          <input
+            value={s.sync_base_url ?? ""}
+            onChange={(e) => setS({ ...s, sync_base_url: e.target.value })}
+            placeholder="https://sync.example.com"
+          />
+        </label>
+        <label>
+          <span className="lbl">Bearer token</span>
+          <input
+            type="password"
+            value={s.sync_token ?? ""}
+            onChange={(e) => setS({ ...s, sync_token: e.target.value })}
+            placeholder="server token"
+          />
+        </label>
+        <label className="row-inline">
+          <input
+            type="checkbox"
+            checked={s.sync_include_cookies ?? false}
+            onChange={(e) => setS({ ...s, sync_include_cookies: e.target.checked })}
+          />
+          <span className="lbl">Include cookies/session login state</span>
+        </label>
+        <label>
+          <span className="lbl">Device ID</span>
+          <CopyField value={syncStatus?.device_id || s.sync_device_id || "Generated after save"} />
+        </label>
+        {syncStatus?.last_cursor && (
+          <p className="muted small">Last cursor: <code>{syncStatus.last_cursor}</code></p>
+        )}
+        <div className="row-inline" style={{ marginTop: 10, gap: 10 }}>
+          <button className="btn-ghost" onClick={syncTest}>Test connection</button>
+          <button className="btn-primary" onClick={syncNow} disabled={syncBusy}>
+            <ShardMini /> {syncBusy ? "Syncing…" : "Sync now"}
+          </button>
+        </div>
+        <p className="muted small" style={{ marginTop: 8 }}>
+          Token protects access, but VPS can read synced cookies unless server-side encryption is added later.
+        </p>
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>

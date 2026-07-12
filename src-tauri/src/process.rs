@@ -123,6 +123,13 @@ impl Tracker {
         self.inner.lock().ok()?.get(profile_id)?.cdp.clone()
     }
 
+    pub fn is_running(&self, profile_id: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.contains_key(profile_id))
+            .unwrap_or(false)
+    }
+
     pub fn running(&self) -> Vec<RunningProfile> {
         let g = self.inner.lock().unwrap();
         g.iter()

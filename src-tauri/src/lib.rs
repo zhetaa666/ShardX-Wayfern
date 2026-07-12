@@ -12,6 +12,7 @@ mod psapi;
 mod runtime;
 mod settings;
 mod store;
+mod sync;
 mod wayfern;
 
 use serde_json::Value;
@@ -854,7 +855,10 @@ fn settings_get() -> Result<settings::Settings, String> {
 }
 
 #[tauri::command]
-fn settings_save(value: settings::Settings) -> Result<(), String> {
+fn settings_save(mut value: settings::Settings) -> Result<(), String> {
+    if value.sync_device_id.trim().is_empty() {
+        value.sync_device_id = uuid::Uuid::new_v4().to_string();
+    }
     settings::save(&value).map_err(|e| e.to_string())
 }
 
@@ -891,6 +895,39 @@ fn api_regenerate_token() -> Result<Value, String> {
         "base_url": format!("http://127.0.0.1:{}", s.api_port),
         "token": token,
     }))
+}
+
+// ---- Self-hosted sync ----
+
+#[tauri::command]
+fn sync_status() -> Result<sync::SyncStatus, String> {
+    sync::status().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sync_test(base_url: String, token: String) -> Result<Value, String> {
+    sync::test_connection(base_url, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sync_now() -> Result<sync::SyncReport, String> {
+    let report = sync::sync_now().await.map_err(|e| e.to_string())?;
+    notify_store_changed("profiles");
+    notify_store_changed("proxies");
+    notify_store_changed("fingerprints");
+    Ok(report)
+}
+
+#[tauri::command]
+fn sync_export_storage_bundle(profile_id: String) -> Result<Vec<u8>, String> {
+    sync::export_storage_bundle(&profile_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn sync_import_storage_bundle(profile_id: String, bytes: Vec<u8>) -> Result<(), String> {
+    sync::import_storage_bundle(&profile_id, &bytes).map_err(|e| e.to_string())
 }
 
 // ---- ProxyShard billing API ----
@@ -1188,6 +1225,11 @@ pub fn run() {
             settings_save,
             api_info,
             api_regenerate_token,
+            sync_status,
+            sync_test,
+            sync_now,
+            sync_export_storage_bundle,
+            sync_import_storage_bundle,
             ps_get_key,
             ps_set_key,
             ps_me,

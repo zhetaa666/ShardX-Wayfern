@@ -33,6 +33,20 @@ pub struct Settings {
     /// (see `ensure_secret`); rotating it invalidates issued tokens.
     #[serde(default)]
     pub api_secret: String,
+
+    /// Self-hosted sync client. Server URL + bearer token are user-provided.
+    #[serde(default)]
+    pub sync_enabled: bool,
+    #[serde(default)]
+    pub sync_base_url: Option<String>,
+    #[serde(default)]
+    pub sync_token: String,
+    #[serde(default)]
+    pub sync_device_id: String,
+    #[serde(default)]
+    pub sync_last_cursor: Option<String>,
+    #[serde(default)]
+    pub sync_include_cookies: bool,
 }
 
 fn default_theme() -> String {
@@ -63,6 +77,12 @@ pub fn load() -> Result<Settings> {
             api_enabled: default_api_enabled(),
             api_port: default_api_port(),
             api_secret: String::new(),
+            sync_enabled: false,
+            sync_base_url: None,
+            sync_token: String::new(),
+            sync_device_id: String::new(),
+            sync_last_cursor: None,
+            sync_include_cookies: false,
         });
     }
     let body = fs::read_to_string(&path)?;
