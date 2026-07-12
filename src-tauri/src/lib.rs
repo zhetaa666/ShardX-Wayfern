@@ -77,6 +77,28 @@ fn profile_get(id: String) -> Result<Value, String> {
 }
 
 /// Recover library fingerprint id by matching webgl.renderer (+ screen if ambiguous).
+fn ensure_profile_not_syncing(profile_id: &str) -> Result<(), String> {
+    if sync::is_profile_locked(profile_id) {
+        return Err("profile is syncing; wait until sync finishes".into());
+    }
+    Ok(())
+}
+
+fn ensure_sync_idle() -> Result<(), String> {
+    if sync::is_active() {
+        return Err("sync is running; wait until it finishes".into());
+    }
+    Ok(())
+}
+
+fn payload_profile_id(payload: &Value) -> Option<&str> {
+    payload
+        .get("_meta")
+        .and_then(|m| m.get("id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
 fn infer_gpu_preset_id(config: &serde_json::Map<String, Value>) -> Option<String> {
     let renderer = config.get("webgl")?.get("renderer")?.as_str()?;
     let scr = config.get("screen");
@@ -379,6 +401,11 @@ fn profile_save(
     window: tauri::WebviewWindow,
     payload: Value,
 ) -> Result<profile::ProfileMeta, String> {
+    if let Some(id) = payload_profile_id(&payload) {
+        ensure_profile_not_syncing(id)?;
+    } else {
+        ensure_sync_idle()?;
+    }
     // UI saves enrich new profiles; the API persists verbatim.
     save_profile_core(Some(&window), payload, true)
 }
@@ -452,11 +479,13 @@ pub fn save_profile_core(
 
 #[tauri::command]
 fn profile_delete(id: String) -> Result<(), String> {
+    ensure_profile_not_syncing(&id)?;
     profile::delete(&id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Result<(), String> {
+    ensure_profile_not_syncing(&profile_id)?;
     let mut p = profile::load_raw(&profile_id).map_err(|e| e.to_string())?;
     p.meta.proxy_id = proxy_id;
     profile::save_raw(&mut p).map_err(|e| e.to_string())
@@ -464,12 +493,14 @@ fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Result<()
 
 #[tauri::command]
 fn profile_clone(id: String) -> Result<profile::ProfileMeta, String> {
+    ensure_profile_not_syncing(&id)?;
     profile::clone_profile(&id).map_err(|e| e.to_string())
 }
 
 /// Import profiles verbatim under fresh ids; returns the count.
 #[tauri::command]
 fn profile_import(payloads: Vec<Value>) -> Result<usize, String> {
+    ensure_sync_idle()?;
     let mut n = 0;
     for mut payload in payloads {
         if let Some(obj) = payload.as_object_mut() {
@@ -504,23 +535,29 @@ fn clipboard_read(app: tauri::AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn profile_set_pin(id: String, pinned: bool) -> Result<(), String> {
+    ensure_profile_not_syncing(&id)?;
     profile::set_pin(&id, pinned).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn profile_set_folder(id: String, folder: String) -> Result<(), String> {
+    ensure_profile_not_syncing(&id)?;
     profile::set_folder(&id, &folder).map_err(|e| e.to_string())
 }
 
 /// Rename folder (retag profiles); returns count.
 #[tauri::command]
 fn folder_rename(old: String, new: String) -> Result<usize, String> {
+    ensure_sync_idle()?;
     profile::rename_folder(&old, &new).map_err(|e| e.to_string())
 }
 
 /// Delete folder; `delete_profiles` true → remove, false → unfile.
 #[tauri::command]
 fn folder_delete(folder: String, delete_profiles: bool) -> Result<usize, String> {
+    if delete_profiles {
+        ensure_sync_idle()?;
+    }
     profile::delete_folder(&folder, delete_profiles).map_err(|e| e.to_string())
 }
 
@@ -541,6 +578,7 @@ fn profile_create_from_template(
     window: tauri::WebviewWindow,
     template_id: String,
 ) -> Result<profile::ProfileMeta, String> {
+    ensure_sync_idle()?;
     create_from_fingerprint_core(Some(&window), &template_id)
 }
 
@@ -689,11 +727,13 @@ fn fingerprint_get(id: String) -> Result<Option<fingerprints::LibraryEntry>, Str
 
 #[tauri::command]
 fn fingerprint_import(json_text: String, id_hint: Option<String>) -> Result<fingerprints::LibraryEntry, String> {
+    ensure_sync_idle()?;
     fingerprints::import(&json_text, id_hint).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn fingerprint_delete(id: String) -> Result<(), String> {
+    ensure_sync_idle()?;
     fingerprints::delete(&id).map_err(|e| e.to_string())
 }
 
@@ -737,11 +777,13 @@ fn proxy_list() -> Result<Vec<proxy::ProxyEntry>, String> {
 
 #[tauri::command]
 fn proxy_save(entry: proxy::ProxyEntry) -> Result<proxy::ProxyEntry, String> {
+    ensure_sync_idle()?;
     proxy::upsert(entry).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn proxy_delete(id: String) -> Result<(), String> {
+    ensure_sync_idle()?;
     proxy::delete(&id).map_err(|e| e.to_string())
 }
 
@@ -777,6 +819,7 @@ fn proxy_last_test(id: String) -> Option<proxy::TestSnapshot> {
 
 #[tauri::command]
 fn proxy_bulk_import(text: String, kind: String) -> Result<usize, String> {
+    ensure_sync_idle()?;
     let default_kind = match kind.as_str() {
         "http" => proxy::ProxyKind::Http,
         "https" => proxy::ProxyKind::Https,
@@ -800,6 +843,7 @@ fn proxy_bulk_parse(text: String, kind: String) -> Vec<proxy::ProxyEntry> {
 /// Persist pre-tested proxies (bulk dialog).
 #[tauri::command]
 fn proxy_bulk_save(entries: Vec<proxy::ProxyEntry>) -> Result<usize, String> {
+    ensure_sync_idle()?;
     proxy::bulk_save(entries).map_err(|e| e.to_string())
 }
 
@@ -807,6 +851,7 @@ fn proxy_bulk_save(entries: Vec<proxy::ProxyEntry>) -> Result<usize, String> {
 
 #[tauri::command]
 async fn launch(profile_id: String) -> Result<u32, String> {
+    ensure_profile_not_syncing(&profile_id)?;
     // UI launches: no CDP, headed.
     launch::launch_profile(&profile_id, false, false)
         .await
@@ -840,6 +885,7 @@ fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, Str
 
 #[tauri::command]
 fn cookies_import(profile_id: String, cookies: Vec<cookies::Cookie>) -> Result<usize, String> {
+    ensure_profile_not_syncing(&profile_id)?;
     // Running browser would clobber the import on exit.
     if is_profile_running(&profile_id) {
         return Err("stop the profile before importing cookies".into());
@@ -905,6 +951,11 @@ fn sync_status() -> Result<sync::SyncStatus, String> {
 }
 
 #[tauri::command]
+fn sync_runtime_status() -> sync::SyncRuntimeStatus {
+    sync::runtime_status()
+}
+
+#[tauri::command]
 async fn sync_test(base_url: String, token: String) -> Result<Value, String> {
     sync::test_connection(base_url, token)
         .await
@@ -927,6 +978,7 @@ fn sync_export_storage_bundle(profile_id: String) -> Result<Vec<u8>, String> {
 
 #[tauri::command]
 fn sync_import_storage_bundle(profile_id: String, bytes: Vec<u8>) -> Result<(), String> {
+    ensure_profile_not_syncing(&profile_id)?;
     sync::import_storage_bundle(&profile_id, &bytes).map_err(|e| e.to_string())
 }
 
@@ -1226,6 +1278,7 @@ pub fn run() {
             api_info,
             api_regenerate_token,
             sync_status,
+            sync_runtime_status,
             sync_test,
             sync_now,
             sync_export_storage_bundle,

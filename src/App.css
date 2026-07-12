@@ -491,11 +491,29 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   pointer-events: none;
 }
 /* Spin animation on the "Starting…" play icon. */
-.btn-launch-ico.spin svg { animation: shardx-spin 0.9s linear infinite; }
+.btn-launch-ico.spin svg, .spin svg { animation: shardx-spin 0.9s linear infinite; }
 @keyframes shardx-spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
 }
+
+.sync-banner {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #8b5cf655;
+  border-radius: var(--radius);
+  background: var(--accent-dim);
+  color: var(--accent-hi);
+  font-size: 13px;
+  font-weight: 500;
+}
+.sync-banner-card { margin: 10px 0 0; }
+.pill-status.ps-sync { background: #8b5cf622; color: var(--accent-hi); border-color: #8b5cf655; }
+.pill-status.ps-sync .dot { background: var(--accent-hi); box-shadow: 0 0 10px #8b5cf6aa; }
+.row-syncing .row { background: #8b5cf608; }
+.row-syncing .cell-name { cursor: wait; }
+.row-syncing .cell-click { cursor: wait; color: var(--tx-3); }
 
 /* Folder picker (inside FolderModal "move" mode) */
 .folder-pick-list {

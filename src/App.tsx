@@ -306,6 +306,15 @@ type SyncReport = {
   skipped: number;
   cursor?: string | null;
 };
+type SyncRuntimeStatus = {
+  active: boolean;
+  phase: string;
+  profile_id?: string | null;
+  message: string;
+  started_at_ms: number;
+  last_report?: SyncReport | null;
+  locked_profiles: string[];
+};
 type Section = "browsers" | "proxies" | "proxyshard" | "fingerprints" | "settings";
 
 /// Library fingerprint backing the editor GPU select; payload supplies the coherent base.
@@ -1037,6 +1046,36 @@ function useStoreChanged(onChange: () => void) {
   }, []);
 }
 
+function useSyncRuntime() {
+  const [syncRuntime, setSyncRuntime] = useState<SyncRuntimeStatus>({
+    active: false,
+    phase: "",
+    profile_id: null,
+    message: "",
+    started_at_ms: 0,
+    last_report: null,
+    locked_profiles: [],
+  });
+  useEffect(() => {
+    let disposed = false;
+    let un: (() => void) | undefined;
+    invoke<SyncRuntimeStatus>("sync_runtime_status").then((s) => {
+      if (!disposed) setSyncRuntime(s);
+    }).catch(() => {});
+    listen<SyncRuntimeStatus>("sync-progress", (e) => {
+      setSyncRuntime(e.payload);
+    }).then((fn) => {
+      if (disposed) fn();
+      else un = fn;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, []);
+  return syncRuntime;
+}
+
 // ---- Browsers view ----
 
 function BrowsersView() {
@@ -1084,6 +1123,10 @@ function BrowsersView() {
       return next;
     });
   const ctx = useContextMenu();
+  const syncRuntime = useSyncRuntime();
+  const profileSyncLocked = (id: string) =>
+    syncRuntime.active && (syncRuntime.locked_profiles.length === 0 || syncRuntime.locked_profiles.includes(id));
+  const syncLockMessage = syncRuntime.message || "Sync in progress";
 
   const reload = async () => {
     try {
@@ -1206,6 +1249,7 @@ function BrowsersView() {
   // On failure we unlock immediately and toast the error.
   const [startBusy, setStartBusy] = useState<Set<string>>(new Set());
   const startStop = async (p: ProfileMeta) => {
+    if (!running[p.id] && profileSyncLocked(p.id)) { toast.info(syncLockMessage); return; }
     if (running[p.id]) {
       try {
         await invoke<boolean>("process_kill", { profileId: p.id });
@@ -1232,12 +1276,14 @@ function BrowsersView() {
   };
 
   const remove = async (id: string) => {
+    if (profileSyncLocked(id)) { toast.info(syncLockMessage); return; }
     if ((await confirmModal({ title: "Delete profile", message: "Delete this profile? Its user-data dir is wiped too.", danger: true })) !== true) return;
     await invoke("profile_delete", { id });
     reload();
   };
 
   const cloneProfile = async (id: string) => {
+    if (profileSyncLocked(id)) { toast.info(syncLockMessage); return; }
     try {
       await invoke<ProfileMeta>("profile_clone", { id });
       reload();
@@ -1260,6 +1306,7 @@ function BrowsersView() {
   };
 
   const importCookies = async (p: ProfileMeta) => {
+    if (profileSyncLocked(p.id)) { toast.info(syncLockMessage); return; }
     if (running[p.id]) { toast.err("Stop the profile before importing cookies"); return; }
     try {
       const path = await open({
@@ -1294,6 +1341,7 @@ function BrowsersView() {
   ];
 
   const togglePin = async (p: ProfileMeta) => {
+    if (profileSyncLocked(p.id)) { toast.info(syncLockMessage); return; }
     try {
       await invoke("profile_set_pin", { id: p.id, pinned: !p.pinned });
       reload();
@@ -1301,6 +1349,7 @@ function BrowsersView() {
   };
 
   const setProfileFolder = async (id: string, f: string) => {
+    if (profileSyncLocked(id)) { toast.info(syncLockMessage); return; }
     // Dropping a profile onto the folder it already lives in is a no-op —
     // tell the user instead of silently doing nothing.
     const p = profiles.find((x) => x.id === id);
@@ -1357,10 +1406,12 @@ function BrowsersView() {
   };
 
   const bulkLaunch = async () => {
+    let skipped = 0;
     for (const id of selected) {
-      if (running[id]) continue;
+      if (running[id] || profileSyncLocked(id)) { skipped++; continue; }
       try { await invoke<number>("launch", { profileId: id }); } catch {}
     }
+    if (skipped > 0) toast.info(`Skipped ${skipped} locked/running profile${skipped === 1 ? "" : "s"}`);
     setSelected(new Set());
   };
 
@@ -1372,15 +1423,16 @@ function BrowsersView() {
   };
 
   const bulkDelete = async () => {
-    const ids = [...selected];
-    if (ids.length === 0) return;
+    const ids = [...selected].filter((id) => !profileSyncLocked(id));
+    const skipped = selected.size - ids.length;
+    if (ids.length === 0) { if (skipped > 0) toast.info(syncLockMessage); return; }
     if ((await confirmModal({ title: "Delete profiles", message: `Delete ${ids.length} profile${ids.length === 1 ? "" : "s"}? This wipes their user-data dirs too.`, danger: true })) !== true) return;
     for (const id of ids) {
       try { await invoke("profile_delete", { id }); } catch (e) { toast.err(String(e)); }
     }
     setSelected(new Set());
     reload();
-    toast.ok(`Deleted ${ids.length}`);
+    toast.ok(`Deleted ${ids.length}${skipped > 0 ? `, skipped ${skipped} syncing` : ""}`);
   };
 
   /// Dump selected profile FingerprintConfigs as a JSON array to clipboard.
@@ -1408,6 +1460,7 @@ function BrowsersView() {
   };
 
   const expand = async (id: string) => {
+    if (profileSyncLocked(id)) { toast.info(syncLockMessage); return; }
     if (expanded === id) { setExpanded(null); setDraft(null); return; }
     const stored = await invoke<any>("profile_get", { id });
     setDraft(fromStored(stored));
@@ -1415,12 +1468,15 @@ function BrowsersView() {
   };
 
   const newProfile = async () => {
+    if (syncRuntime.active && syncRuntime.locked_profiles.length === 0) { toast.info(syncLockMessage); return; }
     setDraft(defaultForm());
     setExpanded("__new__");
   };
 
   const saveDraft = async () => {
     if (!draft) return;
+    if (draft.id && profileSyncLocked(draft.id)) { toast.info(syncLockMessage); return; }
+    if (!draft.id && syncRuntime.active && syncRuntime.locked_profiles.length === 0) { toast.info(syncLockMessage); return; }
     try {
       const fp = fingerprints.find((g) => g.id === draft.gpu_preset_id) ?? null;
       const saved = await invoke<ProfileMeta>("profile_save", { payload: toStored(draft, fp) });
@@ -1458,6 +1514,13 @@ function BrowsersView() {
         <Metric label="Proxies" value={String(proxies.length)} />
         <Metric label="Fingerprints" value={String(fingerprints.length)} />
       </div>
+
+      {syncRuntime.active && (
+        <div className="sync-banner">
+          <span className="spin"><ShardMini /></span>
+          <span>{syncRuntime.message || "Syncing…"}</span>
+        </div>
+      )}
 
       <div className="page-title">
         <div className="title-with-tabs">
@@ -1557,6 +1620,7 @@ function BrowsersView() {
         <TemplatePicker
           fingerprints={fingerprints}
           onPick={async (tplId) => {
+            if (syncRuntime.active && syncRuntime.locked_profiles.length === 0) { toast.info(syncLockMessage); return; }
             try {
               const meta = await invoke<ProfileMeta>("profile_create_from_template", { templateId: tplId });
               setTemplatePickerOpen(false);
@@ -1641,14 +1705,15 @@ function BrowsersView() {
         {paged.map((p) => {
           const px = p.proxy_id ? proxyMap[p.proxy_id] : null;
           const isRunning = !!running[p.id];
+          const isSyncLocked = profileSyncLocked(p.id);
           const isExpanded = expanded === p.id;
           const isSel = selected.has(p.id);
           return (
             <div
               key={p.id}
-              className={`row-wrap ${isRunning ? "row-running" : ""} ${isExpanded ? "row-expanded" : ""} ${p.pinned ? "row-pinned" : ""}`}
+              className={`row-wrap ${isRunning ? "row-running" : ""} ${isSyncLocked ? "row-syncing" : ""} ${isExpanded ? "row-expanded" : ""} ${p.pinned ? "row-pinned" : ""}`}
               onContextMenu={(e) => ctx.open(e, profileMenu(p))}
-              draggable={!isExpanded}
+              draggable={!isExpanded && !isSyncLocked}
               onDragStart={(e) => {
                 e.dataTransfer.effectAllowed = "move";
                 // Set BOTH a custom MIME (so non-folder drop zones can ignore
@@ -1678,7 +1743,7 @@ function BrowsersView() {
                 <div>
                   <input type="checkbox" checked={isSel} onChange={() => toggleSel(p.id)} />
                 </div>
-                <div className="cell-name" onClick={() => expand(p.id)}>
+                <div className="cell-name" onClick={() => !isSyncLocked && expand(p.id)}>
                   <div className="name-main">
                     {p.pinned && <span className="pin-mark" title="Pinned"><Icon.Pin2 /></span>}
                     {p.name}
@@ -1686,12 +1751,12 @@ function BrowsersView() {
                   <div className="name-sub">{p.id.slice(0, 8)}</div>
                 </div>
                 <div>
-                  <span className={`pill-status ${isRunning ? "ps-on" : "ps-off"}`}>
+                  <span className={`pill-status ${isRunning ? "ps-on" : isSyncLocked ? "ps-sync" : "ps-off"}`}>
                     <i className="dot" />
-                    {isRunning ? "Running" : "Idle"}
+                    {isRunning ? "Running" : isSyncLocked ? "Syncing…" : "Idle"}
                   </span>
                 </div>
-                <div className="cell-click" onClick={() => setQuickEdit({ kind: "proxy", profile: p })} title="Change proxy">
+                <div className="cell-click" onClick={() => !isSyncLocked && setQuickEdit({ kind: "proxy", profile: p })} title={isSyncLocked ? syncLockMessage : "Change proxy"}>
                   {px ? (
                     <div className="proxy-cell">
                       <span className={`badge badge-${px.kind}`}>{px.kind}</span>
@@ -1709,8 +1774,8 @@ function BrowsersView() {
                 </div>
                 <div
                   className="cell-notes cell-click"
-                  title={p.notes || "Click to edit notes"}
-                  onClick={() => setQuickEdit({ kind: "notes", profile: p })}
+                  title={isSyncLocked ? syncLockMessage : (p.notes || "Click to edit notes")}
+                  onClick={() => !isSyncLocked && setQuickEdit({ kind: "notes", profile: p })}
                 >
                   {p.notes || <span className="muted">—</span>}
                 </div>
@@ -1728,11 +1793,13 @@ function BrowsersView() {
                   <button
                     className={`btn-launch ${isRunning ? "btn-launch-stop" : ""}`}
                     onClick={() => startStop(p)}
-                    disabled={!isRunning && startBusy.has(p.id)}
-                    title={!isRunning && startBusy.has(p.id) ? "Starting (UDP probe + geo + spawn)…" : undefined}
+                    disabled={!isRunning && (startBusy.has(p.id) || isSyncLocked)}
+                    title={isSyncLocked ? syncLockMessage : (!isRunning && startBusy.has(p.id) ? "Starting (UDP probe + geo + spawn)…" : undefined)}
                   >
                     {isRunning ? (
                       <><span className="btn-launch-ico"><Icon.Stop size={10} /></span><span>Stop</span></>
+                    ) : isSyncLocked ? (
+                      <><span className="btn-launch-ico spin"><ShardMini /></span><span>Syncing…</span></>
                     ) : startBusy.has(p.id) ? (
                       <><span className="btn-launch-ico spin"><Icon.Play size={10} /></span><span>Starting…</span></>
                     ) : (
@@ -1742,13 +1809,14 @@ function BrowsersView() {
                   <button
                     className={`icon-btn ${p.pinned ? "icon-btn-on" : ""}`}
                     onClick={() => togglePin(p)}
-                    title={p.pinned ? "Unpin" : "Pin to top"}
+                    disabled={isSyncLocked}
+                    title={isSyncLocked ? syncLockMessage : (p.pinned ? "Unpin" : "Pin to top")}
                   >
                     <Icon.Pin />
                   </button>
-                  <button className="icon-btn" onClick={() => expand(p.id)} title="Edit"><Icon.Edit /></button>
-                  <button className="icon-btn" onClick={() => cloneProfile(p.id)} title="Clone"><Icon.Clone /></button>
-                  <button className="icon-btn danger" onClick={() => remove(p.id)} title="Delete"><Icon.Trash /></button>
+                  <button className="icon-btn" onClick={() => expand(p.id)} disabled={isSyncLocked} title={isSyncLocked ? syncLockMessage : "Edit"}><Icon.Edit /></button>
+                  <button className="icon-btn" onClick={() => cloneProfile(p.id)} disabled={isSyncLocked} title={isSyncLocked ? syncLockMessage : "Clone"}><Icon.Clone /></button>
+                  <button className="icon-btn danger" onClick={() => remove(p.id)} disabled={isSyncLocked} title={isSyncLocked ? syncLockMessage : "Delete"}><Icon.Trash /></button>
                   <button
                     className="icon-btn"
                     onClick={(e) => { e.stopPropagation(); ctx.open(e, profileMenu(p)); }}
@@ -4945,7 +5013,8 @@ function SettingsView() {
   });
   const [api, setApi] = useState<ApiInfo | null>(null);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
-  const [syncBusy, setSyncBusy] = useState(false);
+  const syncRuntime = useSyncRuntime();
+  const syncBusy = syncRuntime.active;
   const refreshApi = () => invoke<ApiInfo>("api_info").then(setApi).catch(() => {});
   const refreshSync = () => invoke<SyncStatus>("sync_status").then((st) => {
     setSyncStatus(st);
@@ -4980,14 +5049,13 @@ function SettingsView() {
     } catch (e) { toast.err(String(e)); }
   };
   const syncNow = async () => {
-    setSyncBusy(true);
+    if (syncBusy) { toast.info(syncRuntime.message || "Sync already running"); return; }
     try {
       await invoke("settings_save", { value: s });
       const r = await invoke<SyncReport>("sync_now");
       refreshSync();
       toast.ok(`Sync: pushed ${r.pushed}, pulled ${r.pulled}, skipped ${r.skipped}`);
     } catch (e) { toast.err(String(e)); }
-    finally { setSyncBusy(false); }
   };
   return (
     <section className="page settings-page">
@@ -5124,10 +5192,16 @@ function SettingsView() {
         {syncStatus?.last_cursor && (
           <p className="muted small">Last cursor: <code>{syncStatus.last_cursor}</code></p>
         )}
+        {syncRuntime.active && (
+          <div className="sync-banner sync-banner-card">
+            <span className="spin"><ShardMini /></span>
+            <span>{syncRuntime.message || "Syncing…"}</span>
+          </div>
+        )}
         <div className="row-inline" style={{ marginTop: 10, gap: 10 }}>
           <button className="btn-ghost" onClick={syncTest}>Test connection</button>
           <button className="btn-primary" onClick={syncNow} disabled={syncBusy}>
-            <ShardMini /> {syncBusy ? "Syncing…" : "Sync now"}
+            <ShardMini /> {syncBusy ? (syncRuntime.phase || "Syncing…") : "Sync now"}
           </button>
         </div>
         <p className="muted small" style={{ marginTop: 8 }}>

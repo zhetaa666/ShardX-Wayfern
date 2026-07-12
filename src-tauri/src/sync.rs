@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncItem {
@@ -43,6 +45,87 @@ pub struct SyncStatus {
     pub device_id: String,
     pub last_cursor: Option<String>,
     pub include_cookies: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncRuntimeStatus {
+    pub active: bool,
+    pub phase: String,
+    pub profile_id: Option<String>,
+    pub message: String,
+    pub started_at_ms: u64,
+    pub last_report: Option<SyncReport>,
+    pub locked_profiles: Vec<String>,
+}
+
+fn runtime_state() -> &'static Mutex<SyncRuntimeStatus> {
+    static STATE: OnceLock<Mutex<SyncRuntimeStatus>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(SyncRuntimeStatus::default()))
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn runtime_status() -> SyncRuntimeStatus {
+    runtime_state().lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+pub fn is_active() -> bool {
+    runtime_status().active
+}
+
+pub fn is_profile_locked(profile_id: &str) -> bool {
+    let s = runtime_status();
+    s.active && (s.locked_profiles.is_empty() || s.locked_profiles.iter().any(|id| id == profile_id))
+}
+
+fn emit_status(status: &SyncRuntimeStatus) {
+    if let Some(w) = crate::main_window() {
+        let _ = w.emit("sync-progress", status);
+    }
+}
+
+fn begin_sync(phase: &str, profile_id: Option<String>, message: &str) -> Result<()> {
+    let mut s = runtime_state().lock().map_err(|_| anyhow!("sync state lock poisoned"))?;
+    if s.active {
+        return Err(anyhow!("sync already running"));
+    }
+    *s = SyncRuntimeStatus {
+        active: true,
+        phase: phase.into(),
+        locked_profiles: profile_id.iter().cloned().collect(),
+        profile_id,
+        message: message.into(),
+        started_at_ms: unix_now_ms(),
+        last_report: s.last_report.clone(),
+    };
+    emit_status(&s);
+    Ok(())
+}
+
+fn update_sync(phase: &str, message: &str) {
+    if let Ok(mut s) = runtime_state().lock() {
+        s.phase = phase.into();
+        s.message = message.into();
+        emit_status(&s);
+    }
+}
+
+fn finish_sync(report: Option<SyncReport>, message: &str) {
+    if let Ok(mut s) = runtime_state().lock() {
+        s.active = false;
+        s.phase = if report.is_some() { "done".into() } else { "error".into() };
+        s.message = message.into();
+        if report.is_some() {
+            s.last_report = report;
+        }
+        s.locked_profiles.clear();
+        emit_status(&s);
+    }
 }
 
 fn unix_now() -> u64 {
@@ -152,7 +235,7 @@ pub async fn sync_on_startup() {
     if !s.sync_enabled || s.sync_base_url.as_deref().unwrap_or("").is_empty() || s.sync_token.is_empty() {
         return;
     }
-    if let Err(e) = sync_now().await {
+    if let Err(e) = run_sync("startup", None, "Pulling latest sync on startup").await {
         eprintln!("[sync] startup sync failed: {e}");
     }
 }
@@ -162,19 +245,50 @@ pub async fn sync_after_profile_close(profile_id: String) {
     if !s.sync_enabled || s.sync_base_url.as_deref().unwrap_or("").is_empty() || s.sync_token.is_empty() {
         return;
     }
+    let label = format!("Waiting for profile {profile_id} storage flush");
+    if let Err(e) = begin_sync("after_close", Some(profile_id.clone()), &label) {
+        eprintln!("[sync] after close {profile_id} skipped: {e}");
+        return;
+    }
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    match sync_now().await {
-        Ok(r) => eprintln!("[sync] after close {profile_id}: pushed {}, pulled {}, skipped {}", r.pushed, r.pulled, r.skipped),
-        Err(e) => eprintln!("[sync] after close {profile_id} failed: {e}"),
+    match sync_inner().await {
+        Ok(r) => {
+            eprintln!("[sync] after close {profile_id}: pushed {}, pulled {}, skipped {}", r.pushed, r.pulled, r.skipped);
+            finish_sync(Some(r), "Sync complete");
+        }
+        Err(e) => {
+            eprintln!("[sync] after close {profile_id} failed: {e}");
+            finish_sync(None, &format!("Sync failed: {e}"));
+        }
     }
 }
 
 pub async fn sync_now() -> Result<SyncReport> {
+    run_sync("manual", None, "Starting sync").await
+}
+
+async fn run_sync(phase: &str, profile_id: Option<String>, message: &str) -> Result<SyncReport> {
+    begin_sync(phase, profile_id, message)?;
+    match sync_inner().await {
+        Ok(report) => {
+            finish_sync(Some(report.clone()), "Sync complete");
+            Ok(report)
+        }
+        Err(e) => {
+            finish_sync(None, &format!("Sync failed: {e}"));
+            Err(e)
+        }
+    }
+}
+
+async fn sync_inner() -> Result<SyncReport> {
     let mut s = configured()?;
     let base = clean_base_url(s.sync_base_url.as_deref().unwrap_or(""))?;
+    update_sync("collecting", "Collecting local sync data");
     let local = collect_local(&s)?;
     let c = client();
 
+    update_sync("pushing", &format!("Pushing {} local item(s)", local.len()));
     auth(c.post(format!("{base}/sync/push")), &s.sync_token)
         .json(&SyncBatch {
             items: local.clone(),
@@ -184,6 +298,7 @@ pub async fn sync_now() -> Result<SyncReport> {
         .await?
         .error_for_status()?;
 
+    update_sync("pulling", "Pulling remote changes");
     let mut req = c.get(format!("{base}/sync/changes"));
     if let Some(cursor) = s.sync_last_cursor.as_ref() {
         req = req.query(&[("since", cursor)]);
@@ -195,6 +310,7 @@ pub async fn sync_now() -> Result<SyncReport> {
         .json::<SyncBatch>()
         .await?;
 
+    update_sync("applying", &format!("Applying {} remote item(s)", remote.items.len()));
     let apply = apply_remote(&remote.items)?;
     if remote.cursor != s.sync_last_cursor {
         s.sync_last_cursor = remote.cursor.clone();
