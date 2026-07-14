@@ -895,7 +895,9 @@ async fn launch(profile_id: String) -> Result<u32, String> {
     }
 
     // Device lease: block if the profile is open on another live device, so we
-    // don't overwrite its cookies.  Sync off / unreachable → skip silently.
+    // don't overwrite its cookies.  Sync off → skip.  Server unreachable or
+    // missing the /lease routes (old sync-server build) → warn but launch,
+    // so an outage never bricks the Start button.
     if sync_on {
         match sync::acquire_lease(&profile_id).await {
             Ok(state) if !state.held_by_me && !state.free => {
@@ -905,7 +907,24 @@ async fn launch(profile_id: String) -> Result<u32, String> {
                     .unwrap_or_else(|| state.holder_device.clone());
                 return Err(format!("profile is open on another device ({who})"));
             }
-            _ => {}
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[launcher] lease acquire failed for {profile_id}: {e}");
+                if let Some(w) = main_window() {
+                    use tauri::Emitter;
+                    let _ = w.emit(
+                        "launch-warning",
+                        serde_json::json!({
+                            "profile_id": profile_id,
+                            "message": format!(
+                                "Device lease unavailable ({e}) — launching anyway. \
+                                 If this persists, update the sync server (it may \
+                                 predate the /lease API)."
+                            ),
+                        }),
+                    );
+                }
+            }
         }
     }
 

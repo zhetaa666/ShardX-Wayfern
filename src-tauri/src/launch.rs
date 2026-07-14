@@ -55,34 +55,22 @@ pub async fn launch_profile(
         .and_then(|pid| proxy::get(pid).ok().flatten())
         .or_else(|| stored.meta.inline_proxy.clone());
 
-    // Live UDP probe; QUIC/WebRTC gating uses current capability not stale cache.
-    let proxy_udp_ok = if let Some(p) = bound_proxy.as_ref() {
-        if matches!(p.kind, proxy::ProxyKind::Socks5) {
-            match proxy::probe_udp(p).await {
-                Ok(ms) => {
-                    eprintln!("[launcher] UDP relay OK ({ms} ms) for proxy {}", p.host);
-                    true
-                }
-                Err(e) => {
-                    let cached = proxy::latest_test(&p.id).and_then(|s| s.udp_ms).is_some();
-                    eprintln!(
-                        "[launcher] UDP probe failed for proxy {} ({e}); using cached={cached}",
-                        p.host
-                    );
-                    cached
-                }
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    // UDP capability from the proxy's last full test (cached). No live probe
+    // at launch: a per-launch UDP_ASSOCIATE both delays the spawn and, on
+    // typical SOCKS5 providers, degrades the relay for sessions that are
+    // already browsing — noticeable when several profiles run concurrently.
+    let proxy_udp_ok = bound_proxy
+        .as_ref()
+        .map(|p| {
+            matches!(p.kind, proxy::ProxyKind::Socks5)
+                && proxy::latest_test(&p.id).and_then(|s| s.udp_ms).is_some()
+        })
+        .unwrap_or(false);
 
     // Strip `_meta` wrapper and resolve "auto" sentinels before serialising.
     let mut raw = stored.config.clone();
     raw.remove("_meta");
-    resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
+    let auto_geo = resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
     let json = serde_json::to_string(&raw).context("serialize profile")?;
 
     // Pass fingerprint by file path — inline JSON overflows Windows' 32767-char CreateProcess limit.
@@ -117,17 +105,13 @@ pub async fn launch_profile(
     if let Some(p) = bound_proxy.as_ref() {
         cmd.arg(format!("--proxy-server={}", p.to_proxy_server_arg()));
 
-        // QUIC: enable only when proxy UDP relay verified; rely on Alt-Svc upgrade path.
-        if proxy_udp_ok {
-            cmd.arg("--enable-quic");
-            eprintln!(
-                "[launcher] QUIC enabled (Alt-Svc upgrade path): proxy {} UDP relay verified",
-                p.host
-            );
-        } else {
-            cmd.arg("--disable-quic");
-            eprintln!("[launcher] QUIC disabled: proxy {} has no working UDP relay", p.host);
-        }
+        // QUIC always OFF behind a proxy.  Chromium routes HTTP/3 through the
+        // SOCKS5 UDP relay, which commercial proxies rate-limit or half-break;
+        // the QUIC/TCP race then stalls every page load and gets dramatically
+        // worse with several concurrent profiles.  Paid antidetect browsers
+        // ship the same policy: proxy bound → no QUIC.
+        cmd.arg("--disable-quic");
+        eprintln!("[launcher] QUIC disabled (proxy bound: {})", p.host);
     }
 
     // WebRTC IP policy: block / tcp_only / auto (auto = relay if UDP, else tcp_only).
@@ -138,12 +122,16 @@ pub async fn launch_profile(
     let latest = bound_proxy
         .as_ref()
         .and_then(|p| proxy::latest_test(&p.id));
-    // Live geo for ICE-candidate spoofing, cached snapshot as fallback.
-    let proxy_public_ip: Option<String> = if let Some(p) = bound_proxy.as_ref() {
-        match proxy::geo_check(p, None).await {
-            Ok(g) if !g.ip.is_empty() => Some(g.ip),
-            _ => latest.as_ref().map(|s| s.ip.clone()).filter(|ip| !ip.is_empty()),
-        }
+    // Public IP for ICE-candidate spoofing: reuse the geo fetched during
+    // auto-field resolution when available, else the cached test snapshot.
+    // Never a live lookup here — launch already cost one geo round-trip at
+    // most, and hammering the proxy at spawn slows concurrent sessions.
+    let proxy_public_ip: Option<String> = if bound_proxy.is_some() {
+        auto_geo
+            .as_ref()
+            .map(|g| g.ip.clone())
+            .filter(|ip| !ip.is_empty())
+            .or_else(|| latest.as_ref().map(|s| s.ip.clone()).filter(|ip| !ip.is_empty()))
     } else {
         None
     };
@@ -254,10 +242,12 @@ async fn read_devtools_endpoint(udd: &Path) -> Option<process::CdpInfo> {
 }
 
 /// Resolve "auto" sentinels in profile JSON; with proxy: live → cached → country tag → host warn.
+/// Returns the geo info it used (if any) so the caller can reuse it (e.g. for
+/// the WebRTC public-IP flag) without a second network round-trip.
 async fn resolve_auto_fields(
     cfg: &mut serde_json::Map<String, serde_json::Value>,
     proxy_opt: Option<&proxy::ProxyEntry>,
-) {
+) -> Option<proxy::GeoInfo> {
     let want_tz_auto = cfg.get("timezone").and_then(|v| v.as_str()) == Some("auto");
     let want_lang_auto = cfg
         .get("navigator")
@@ -270,7 +260,7 @@ async fn resolve_auto_fields(
     );
 
     if !(want_tz_auto || want_lang_auto || want_geo_auto) {
-        return;
+        return None;
     }
 
     eprintln!(
@@ -282,31 +272,39 @@ async fn resolve_auto_fields(
     );
 
     // ---- geo source ----
+    // Cached-first: the proxy's last full-test snapshot already carries
+    // ip/tz/locale/lat-lng, so reuse it and skip the live round-trip.  A live
+    // geo_check per launch adds seconds of latency and — with several
+    // profiles starting in a batch — piles concurrent requests onto the
+    // proxy exactly when the first sessions begin browsing.  Live lookup
+    // remains the fallback for never-tested proxies.
     let mut source = "";
     let geo: Option<proxy::GeoInfo> = match proxy_opt {
         Some(p) => {
-            match proxy::geo_check_via(Some(p), None).await {
-                Ok(g) => { source = "proxy-live"; Some(g) }
-                Err(e) => {
-                    eprintln!("[launcher] proxy geo failed: {e} — falling back to cached snapshot");
-                    if let Some(snap) = proxy::latest_test(&p.id) {
-                        if !snap.country_code.is_empty() || !snap.timezone.is_empty() {
-                            source = "cached-snapshot";
-                            Some(proxy::GeoInfo {
-                                ip: snap.ip,
-                                country: snap.country,
-                                country_code: snap.country_code,
-                                region: snap.region,
-                                city: snap.city,
-                                isp: snap.isp,
-                                timezone: snap.timezone,
-                                latitude: snap.latitude,
-                                longitude: snap.longitude,
-                                provider: snap.provider,
-                            })
-                        } else { None }
-                    } else { None }
-                    .or_else(|| {
+            let cached = proxy::latest_test(&p.id).and_then(|snap| {
+                if !snap.country_code.is_empty() || !snap.timezone.is_empty() {
+                    Some(proxy::GeoInfo {
+                        ip: snap.ip,
+                        country: snap.country,
+                        country_code: snap.country_code,
+                        region: snap.region,
+                        city: snap.city,
+                        isp: snap.isp,
+                        timezone: snap.timezone,
+                        latitude: snap.latitude,
+                        longitude: snap.longitude,
+                        provider: snap.provider,
+                    })
+                } else {
+                    None
+                }
+            });
+            match cached {
+                Some(g) => { source = "cached-snapshot"; Some(g) }
+                None => match proxy::geo_check_via(Some(p), None).await {
+                    Ok(g) => { source = "proxy-live"; Some(g) }
+                    Err(e) => {
+                        eprintln!("[launcher] proxy geo failed: {e} — falling back to country tag");
                         if !p.country.is_empty() {
                             source = "country-tag";
                             Some(proxy::GeoInfo {
@@ -322,8 +320,8 @@ async fn resolve_auto_fields(
                                 provider: String::new(),
                             })
                         } else { None }
-                    })
-                }
+                    }
+                },
             }
         }
         None => {
@@ -423,6 +421,8 @@ async fn resolve_auto_fields(
             cfg.remove("geolocation");
         }
     }
+
+    geo
 }
 
 /// Copy cached Widevine CDM into `<udd>/WidevineCdm/<version>/` (versioned layout

@@ -1258,9 +1258,9 @@ function BrowsersView() {
 
   // Block the Start button until `invoke("launch")` returns (success or
   // failure).  The launch includes pre-flight steps that can take real time
-  // — UDP probe, geo lookup, Widevine pre-warm — and surfacing the busy
-  // state for the whole window is what the user sees as "did it work?".
-  // On failure we unlock immediately and toast the error.
+  // — cloud pull, geo resolution for never-tested proxies, Widevine pre-warm
+  // — and surfacing the busy state for the whole window is what the user
+  // sees as "did it work?".  On failure we unlock immediately and toast.
   const [startBusy, setStartBusy] = useState<Set<string>>(new Set());
   // Profiles reported "open on another device" — shows an amber In-use badge.
   const [inUse, setInUse] = useState<Record<string, string>>({});
@@ -1823,7 +1823,7 @@ function BrowsersView() {
                     className={`btn-launch ${isRunning ? "btn-launch-stop" : ""}`}
                     onClick={() => startStop(p)}
                     disabled={!isRunning && (startBusy.has(p.id) || isSyncLocked)}
-                    title={isSyncLocked ? syncLockMessage : (!isRunning && startBusy.has(p.id) ? "Starting (UDP probe + geo + spawn)…" : undefined)}
+                    title={isSyncLocked ? syncLockMessage : (!isRunning && startBusy.has(p.id) ? "Starting…" : undefined)}
                   >
                     {isRunning ? (
                       <><span className="btn-launch-ico"><Icon.Stop size={10} /></span><span>Stop</span></>
