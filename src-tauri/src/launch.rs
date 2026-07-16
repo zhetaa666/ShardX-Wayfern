@@ -87,13 +87,28 @@ pub async fn launch_profile(
     cmd.arg(format!("--user-data-dir={}", udd.display()));
     cmd.arg("--no-first-run");
 
-    // Disable WebGPU when profile omits `webgpu` (matches real Linux Chrome).
+    // Chromium only honors the last --disable-features argument.
     let webgpu_present = raw
         .get("webgpu")
         .map(|v| !v.is_null())
         .unwrap_or(false);
+    let keep_cdp_active = enable_cdp
+        && !headless
+        && settings::load()?.api_disable_background_throttling;
+    let mut disabled_features = Vec::new();
     if !webgpu_present {
-        cmd.arg("--disable-features=WebGPU");
+        disabled_features.push("WebGPU");
+    }
+    if keep_cdp_active {
+        disabled_features.push("CalculateNativeWinOcclusion");
+    }
+    if !disabled_features.is_empty() {
+        cmd.arg(format!("--disable-features={}", disabled_features.join(",")));
+    }
+    if keep_cdp_active {
+        cmd.arg("--disable-background-timer-throttling");
+        cmd.arg("--disable-backgrounding-occluded-windows");
+        cmd.arg("--disable-renderer-backgrounding");
     }
 
     // Interactive launches: restore previous session, suppress crash bubble.

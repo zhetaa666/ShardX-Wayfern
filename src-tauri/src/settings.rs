@@ -33,6 +33,9 @@ pub struct Settings {
     /// (see `ensure_secret`); rotating it invalidates issued tokens.
     #[serde(default)]
     pub api_secret: String,
+    /// Keep headed CDP renderers active when their windows are minimized or occluded.
+    #[serde(default = "default_true")]
+    pub api_disable_background_throttling: bool,
 
     /// Self-hosted sync client. Server URL + bearer token are user-provided.
     #[serde(default)]
@@ -95,6 +98,7 @@ pub fn load() -> Result<Settings> {
             api_enabled: default_api_enabled(),
             api_port: default_api_port(),
             api_secret: String::new(),
+            api_disable_background_throttling: true,
             sync_enabled: false,
             sync_base_url: None,
             sync_token: String::new(),

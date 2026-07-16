@@ -280,6 +280,7 @@ type Settings = {
   api_enabled?: boolean;
   api_port?: number;
   api_secret?: string;
+  api_disable_background_throttling?: boolean;
   sync_enabled?: boolean;
   sync_base_url?: string | null;
   sync_token?: string;
@@ -5035,6 +5036,7 @@ function SettingsView() {
     screen_resolution_mode: "fingerprint",
     api_enabled: true,
     api_port: 40325,
+    api_disable_background_throttling: true,
     sync_enabled: false,
     sync_base_url: null,
     sync_token: "",
@@ -5152,6 +5154,17 @@ function SettingsView() {
           />
           <span className="lbl">Enable API server</span>
         </label>
+        <label className="row-inline">
+          <input
+            type="checkbox"
+            checked={s.api_disable_background_throttling ?? true}
+            onChange={(e) => setS({ ...s, api_disable_background_throttling: e.target.checked })}
+          />
+          <span className="lbl">Keep CDP profiles active when minimized</span>
+        </label>
+        <p className="muted small">
+          Applies to new headed API/MCP launches. Keeps automation responsive when windows are minimized or covered, at the cost of higher CPU usage.
+        </p>
         <label>
           <span className="lbl">Port</span>
           <input
