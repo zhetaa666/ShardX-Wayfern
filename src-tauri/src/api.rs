@@ -460,7 +460,10 @@ async fn start_profile(Path(id): Path<String>, body: Option<Json<StartReq>>) -> 
     crate::ensure_profile_not_syncing(&id).map_err(|e| err(StatusCode::CONFLICT, e))?;
     let cfg = crate::settings::load().ok();
     let sync_on = cfg.as_ref().map(|s| s.sync_enabled).unwrap_or(false);
-    if sync_on && cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
+    let temporary = crate::profile::load_raw(&id)
+        .map(|p| p.meta.temporary)
+        .unwrap_or(false);
+    if !temporary && sync_on && cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
         if let Err(e) = crate::sync::pull_profile(&id).await {
             eprintln!("[sync] API pre-launch sync failed for {id}: {e}");
         }
