@@ -495,9 +495,19 @@ fn profile_delete(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Result<(), String> {
+async fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Result<(), String> {
     ensure_profile_not_syncing(&profile_id)?;
     let mut p = profile::load_raw(&profile_id).map_err(|e| e.to_string())?;
+    if let Some(id) = proxy_id.as_deref() {
+        let entry = proxy::get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "selected proxy no longer exists".to_string())?;
+        if profile::uses_proxy_auto_fields(&p.config) {
+            proxy::ensure_cached_geo(&entry).await.map_err(|e| {
+                format!("Proxy GeoIP auto-detection failed: {e}. Test the proxy, then bind it again.")
+            })?;
+        }
+    }
     p.meta.proxy_id = proxy_id;
     profile::save_raw(&mut p).map_err(|e| e.to_string())
 }

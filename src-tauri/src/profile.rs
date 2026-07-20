@@ -19,6 +19,20 @@ pub fn normalize_browser_engine(engine: &str) -> &'static str {
     }
 }
 
+pub fn uses_proxy_auto_fields(config: &serde_json::Map<String, serde_json::Value>) -> bool {
+    config.get("timezone").and_then(|v| v.as_str()) == Some("auto")
+        || config
+            .get("navigator")
+            .and_then(|n| n.get("language"))
+            .and_then(|v| v.as_str())
+            == Some("auto")
+        || config
+            .get("geolocation")
+            .and_then(|g| g.get("mode"))
+            .and_then(|v| v.as_str())
+            == Some("auto")
+}
+
 /// Launcher-side view of a profile (wraps raw FingerprintConfig JSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileMeta {

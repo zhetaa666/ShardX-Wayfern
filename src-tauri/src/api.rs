@@ -226,6 +226,14 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
     }
     let mut meta = json!({ "id": "", "folder": folder, "browser_engine": engine });
     if let Some(pid) = body.proxy_id.as_ref() {
+        let entry = crate::proxy::get(pid)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "selected proxy no longer exists"))?;
+        if crate::profile::uses_proxy_auto_fields(&cfg) {
+            crate::proxy::ensure_cached_geo(&entry)
+                .await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP auto-detection failed: {e}")))?;
+        }
         meta["proxy_id"] = json!(pid);
     } else if let Some(pstr) = body.proxy.as_ref() {
         let entry = crate::proxy::parse_single(pstr)
@@ -338,7 +346,19 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
         stored.config.insert("notes".into(), json!(n));
     }
     if let Some(pid) = body.proxy_id.as_ref() {
-        stored.meta.proxy_id = if pid.is_empty() { None } else { Some(pid.clone()) };
+        if pid.is_empty() {
+            stored.meta.proxy_id = None;
+        } else {
+            let entry = crate::proxy::get(pid)
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .ok_or_else(|| err(StatusCode::BAD_REQUEST, "selected proxy no longer exists"))?;
+            if crate::profile::uses_proxy_auto_fields(&stored.config) {
+                crate::proxy::ensure_cached_geo(&entry)
+                    .await
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP auto-detection failed: {e}")))?;
+            }
+            stored.meta.proxy_id = Some(pid.clone());
+        }
         stored.meta.inline_proxy = None;
     } else if let Some(pstr) = body.proxy.as_ref() {
         let entry = crate::proxy::parse_single(pstr)
