@@ -192,6 +192,7 @@ async fn new_fingerprint_impl(platform: Option<String>) -> ApiResult {
 struct CreateReq {
     name: Option<String>,
     notes: Option<String>,
+    browser_engine: Option<String>,
     proxy_id: Option<String>,
     /// Proxy string: added to store + full-tested, bound by id.
     proxy: Option<String>,
@@ -215,7 +216,15 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
     }
 
     let folder = folder_override.or(body.folder).unwrap_or_default();
-    let mut meta = json!({ "id": "", "folder": folder });
+    let engine = crate::profile::normalize_browser_engine(
+        body.browser_engine.as_deref().unwrap_or(crate::profile::ENGINE_SHARDX),
+    );
+    if engine == crate::profile::ENGINE_IXBROWSER_145
+        && cfg.get("navigator").and_then(|v| v.get("platform")).and_then(Value::as_str) != Some("Windows")
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "ixbrowser-145 requires a Windows fingerprint"));
+    }
+    let mut meta = json!({ "id": "", "folder": folder, "browser_engine": engine });
     if let Some(pid) = body.proxy_id.as_ref() {
         meta["proxy_id"] = json!(pid);
     } else if let Some(pstr) = body.proxy.as_ref() {
@@ -403,8 +412,12 @@ async fn start_profile(Path(id): Path<String>, body: Option<Json<StartReq>>) -> 
     let outcome = crate::launch::launch_profile(&id, true, headless)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let engine = crate::profile::load_raw(&id)
+        .map(|p| crate::profile::normalize_browser_engine(&p.meta.browser_engine).to_string())
+        .unwrap_or_else(|_| crate::profile::ENGINE_SHARDX.into());
     Ok(Json(json!({
         "profile_id": id,
+        "browser_engine": engine,
         "pid": outcome.pid,
         "headless": headless,
         "cdp": outcome.cdp,

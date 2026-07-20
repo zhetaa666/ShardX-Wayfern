@@ -328,7 +328,7 @@ fn cookies_db_path(udd: &Path) -> PathBuf {
 
 /// Export decrypted cookies.
 pub fn export(profile_id: &str) -> Result<Vec<Cookie>> {
-    let udd = profile::user_data_dir(profile_id)?;
+    let udd = profile::profile_user_data_dir(profile_id)?;
     let path = cookies_db_path(&udd);
     if !path.exists() {
         return Ok(Vec::new());
@@ -380,7 +380,7 @@ pub fn export(profile_id: &str) -> Result<Vec<Cookie>> {
 
 /// Import cookies (v10-encrypted). Caller MUST stop the profile first.
 pub fn import(profile_id: &str, cookies: &[Cookie]) -> Result<usize> {
-    let udd = profile::user_data_dir(profile_id)?;
+    let udd = profile::profile_user_data_dir(profile_id)?;
     let path = cookies_db_path(&udd);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();

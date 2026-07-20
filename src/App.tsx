@@ -247,10 +247,12 @@ function useContextMenu() {
 
 // ---- backend types ----
 
+type BrowserEngine = "shardx" | "ixbrowser-145";
 type ProfileMeta = {
   id: string;
   name: string;
   notes: string;
+  browser_engine: BrowserEngine;
   proxy_id: string | null;
   last_launched_at: string | null;
   created_at: string | null;
@@ -274,6 +276,7 @@ type ProxyEntry = {
 };
 type Settings = {
   browser_path: string | null;
+  ixbrowser_145_path: string | null;
   theme: string;
   geo_checker?: string | null;
   screen_resolution_mode?: string | null;
@@ -333,6 +336,21 @@ type FingerprintEntry = {
   payload: any;
 };
 
+type IxBrowserStatus = {
+  installed: boolean;
+  version: string;
+  binary_path: string | null;
+  size_bytes: number | null;
+  manual_path: string | null;
+};
+type IxBrowserProgress = {
+  phase: string;
+  received: number;
+  total: number;
+  percent: number;
+  source: string;
+};
+
 type WayfernStatus = {
   installed: boolean;
   binary_path: string | null;
@@ -357,6 +375,7 @@ type ProfileForm = {
   id: string;
   name: string;
   notes: string;
+  browser_engine: BrowserEngine;
   proxy_id: string | null;
 
   gpu_preset_id: string;
@@ -488,6 +507,7 @@ const defaultForm = (): ProfileForm => ({
   id: "",
   name: "",
   notes: "",
+  browser_engine: "shardx",
   proxy_id: null,
 
   // Empty until snapped to gpusForOs[0] by useEffect.
@@ -527,6 +547,7 @@ function fromStored(stored: any): ProfileForm {
   const f = defaultForm();
   if (!stored) return f;
   f.id = stored?._meta?.id ?? "";
+  f.browser_engine = stored?._meta?.browser_engine === "ixbrowser-145" ? "ixbrowser-145" : "shardx";
   f.proxy_id = stored?._meta?.proxy_id ?? null;
   f.name = stored?.name ?? "";
   f.notes = stored?.notes ?? "";
@@ -580,6 +601,7 @@ function toStored(f: ProfileForm, lib: FingerprintEntry | null): any {
 
   base._meta = {
     id: f.id,
+    browser_engine: f.browser_engine,
     proxy_id: f.proxy_id,
     last_launched_at: null,
     gpu_preset_id: f.gpu_preset_id,
@@ -1771,7 +1793,9 @@ function BrowsersView() {
                     {p.pinned && <span className="pin-mark" title="Pinned"><Icon.Pin2 /></span>}
                     {p.name}
                   </div>
-                  <div className="name-sub">{p.id.slice(0, 8)}</div>
+                  <div className="name-sub">
+                    {p.id.slice(0, 8)} · {p.browser_engine === "ixbrowser-145" ? "Chromium 145" : "ShardX 149"}
+                  </div>
                 </div>
                 <div>
                   {!isRunning && !isSyncLocked && inUse[p.id] ? (
@@ -2060,6 +2084,25 @@ function InlineEditor({
         <div className="ie-section">
           <div className="ie-section-title">Identity</div>
           <Field label="Profile name" value={f.name} onChange={(v) => u("name", v)} placeholder="e.g. shop-pl-1" />
+
+          <label>
+            <span className="lbl">Base Chromium</span>
+            {f.id ? (
+              <div className="mono-field">
+                {f.browser_engine === "ixbrowser-145" ? "Chromium 145 compatibility" : "ShardX Chromium 149"}
+              </div>
+            ) : (
+              <CSSelect
+                value={f.browser_engine}
+                onChange={(v) => u("browser_engine", v as BrowserEngine)}
+                options={[
+                  { value: "shardx", label: "ShardX Chromium 149" },
+                  { value: "ixbrowser-145", label: "Chromium 145 compatibility (Windows)" },
+                ]}
+              />
+            )}
+            {f.id && <span className="muted small">Base Chromium is fixed after creation.</span>}
+          </label>
 
           <label>
             <span className="lbl">Operating system</span>
@@ -5031,6 +5074,7 @@ function PsBuyCard({ onPurchased }: { onPurchased: () => void }) {
 function SettingsView() {
   const [s, setS] = useState<Settings>({
     browser_path: null,
+    ixbrowser_145_path: null,
     theme: "dark",
     geo_checker: "ip-api.com",
     screen_resolution_mode: "fingerprint",
@@ -5048,15 +5092,31 @@ function SettingsView() {
     sync_device_label: null,
   });
   const [api, setApi] = useState<ApiInfo | null>(null);
+  const [ixStatus, setIxStatus] = useState<IxBrowserStatus | null>(null);
+  const [ixProgress, setIxProgress] = useState<IxBrowserProgress | null>(null);
+  const [ixBusy, setIxBusy] = useState(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const syncRuntime = useSyncRuntime();
   const syncBusy = syncRuntime.active;
   const refreshApi = () => invoke<ApiInfo>("api_info").then(setApi).catch(() => {});
+  const refreshIx = () => invoke<IxBrowserStatus>("ixbrowser_status").then(setIxStatus).catch(() => {});
   const refreshSync = () => invoke<SyncStatus>("sync_status").then((st) => {
     setSyncStatus(st);
     setS((cur) => ({ ...cur, sync_device_id: st.device_id, sync_last_cursor: st.last_cursor ?? null }));
   }).catch(() => {});
-  useEffect(() => { invoke<Settings>("settings_get").then(setS); refreshApi(); refreshSync(); }, []);
+  useEffect(() => {
+    invoke<Settings>("settings_get").then(setS);
+    refreshApi(); refreshIx(); refreshSync();
+    let offProgress: (() => void) | undefined;
+    let offDone: (() => void) | undefined;
+    listen<IxBrowserProgress>("ixbrowser:progress", (e) => setIxProgress(e.payload)).then((fn) => { offProgress = fn; });
+    listen<IxBrowserStatus>("ixbrowser:done", (e) => {
+      setIxStatus(e.payload);
+      setIxBusy(false);
+      setIxProgress(null);
+    }).then((fn) => { offDone = fn; });
+    return () => { offProgress?.(); offDone?.(); };
+  }, []);
   const regenToken = async () => {
     try { setApi(await invoke<ApiInfo>("api_regenerate_token")); toast.ok("Token regenerated"); }
     catch (e) { toast.err(String(e)); }
@@ -5074,8 +5134,18 @@ function SettingsView() {
     } catch (e) { toast.err("MCP download failed: " + String(e)); }
     finally { setMcpBusy(false); }
   };
+  const installIx = async (force: boolean) => {
+    setIxBusy(true);
+    setIxProgress(null);
+    try {
+      const status = await invoke<IxBrowserStatus>("ixbrowser_install", { force });
+      setIxStatus(status);
+      toast.ok(`Chromium ${status.version} installed`);
+    } catch (e) { toast.err("Chromium 145 install failed: " + String(e)); }
+    finally { setIxBusy(false); }
+  };
   const save = async () => {
-    try { await invoke("settings_save", { value: s }); toast.ok("Settings saved"); }
+    try { await invoke("settings_save", { value: s }); refreshIx(); toast.ok("Settings saved"); }
     catch (e) { toast.err(String(e)); }
   };
   const syncTest = async () => {
@@ -5098,6 +5168,46 @@ function SettingsView() {
       <Topbar crumbs={["System", "Settings"]} search="" onSearch={() => {}} />
       <div className="page-title"><h1>Settings</h1></div>
 
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3>Chromium 145 compatibility</h3>
+        <p className="muted small">
+          Optional Windows-only engine. Download it from your ShardX R2 runtime, or choose a local
+          ixBrowser Chromium 145 <code>chrome.exe</code>. ShardX Chromium remains the default.
+        </p>
+        <div className="row-inline" style={{ gap: 10, marginBottom: 12 }}>
+          <span className={`status-pill ${ixStatus?.installed ? "status-active" : "status-failed"}`}>
+            {ixStatus?.installed ? `Installed · ${ixStatus.version}` : "Not installed"}
+          </span>
+          {ixStatus?.binary_path && <span className="mono small muted">{ixStatus.binary_path}</span>}
+          <button className="btn-primary" disabled={ixBusy} onClick={() => installIx(!!ixStatus?.installed)}>
+            <Icon.Download /> {ixBusy ? "Installing…" : ixStatus?.installed ? "Reinstall" : "Download engine"}
+          </button>
+        </div>
+        {ixProgress && (
+          <div style={{ marginBottom: 12 }}>
+            <div className="muted small">{ixProgress.phase} · {ixProgress.percent}% · {ixProgress.source}</div>
+            <progress value={ixProgress.percent} max={100} style={{ width: "100%" }} />
+          </div>
+        )}
+        <label>
+          <span className="lbl">Chromium 145 executable</span>
+          <div className="row-inline" style={{ gap: 8 }}>
+            <input className="mono" value={s.ixbrowser_145_path ?? ""} readOnly placeholder="Not configured" />
+            <button className="btn-ghost" onClick={async () => {
+              const path = await open({
+                multiple: false,
+                directory: false,
+                title: "Select ixBrowser Chromium 145 chrome.exe",
+                filters: [{ name: "Chromium executable", extensions: ["exe"] }],
+              });
+              if (typeof path === "string") setS({ ...s, ixbrowser_145_path: path });
+            }}>Browse…</button>
+            {s.ixbrowser_145_path && (
+              <button className="btn-ghost" onClick={() => setS({ ...s, ixbrowser_145_path: null })}>Clear</button>
+            )}
+          </div>
+        </label>
+      </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
         <h3>Proxy geo checker</h3>

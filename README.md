@@ -151,6 +151,12 @@ across iframes, web workers, devtools and headless inspection.
   Chrome sessions ("Continue where you left off" without the
   crash-restore bubble), bulk import, folder / tag organisation, pin
   to top, clone.
+* **Optional Chromium 145 base (Windows)** — new profiles can keep the
+  bundled ShardX Chromium 149 default or use a locally installed ixBrowser
+  Chromium 145 compatibility binary. The same ShardX fingerprint library is
+  adapted to its native config format, storage stays isolated per engine,
+  and automation remains standard CDP. Configure the local `chrome.exe` in
+  *Settings → Chromium 145 compatibility*; no third-party binary is bundled.
 * **Fingerprint library** — 170 starter profiles shipped via CDN
   (31 mac-arm64 / 120 windows-x64 / 19 linux-x64). Profile editor
   randomises CPU / RAM / platform-version when you change the GPU.
