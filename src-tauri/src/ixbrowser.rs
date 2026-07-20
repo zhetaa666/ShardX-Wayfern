@@ -382,19 +382,23 @@ pub fn build_launch_config(
     });
 
     let mut dynamic = Map::new();
-    dynamic.insert("BlockList".into(), json!({ "udp": "", "tcp": "" }));
-    dynamic.insert("TimeZone".into(), json!({ "id": timezone }));
+    dynamic.insert(
+        "BlockList".into(),
+        json!({ "Version": "2", "Domains": [] }),
+    );
+    dynamic.insert("TimeZone".into(), json!(timezone));
     if let Some(g) = geo {
         if g.latitude != 0.0 && g.longitude != 0.0 {
             dynamic.insert(
                 "Geoposition".into(),
-                json!({ "accuracy": 50, "latitude": g.latitude, "longitude": g.longitude }),
+                Value::String(format!("{},{},50", g.latitude, g.longitude)),
             );
         }
     }
     if let Some(ip) = public_ip.filter(|v| !v.is_empty()) {
         dynamic.insert("PublicIP".into(), Value::String(ip.into()));
-        dynamic.insert("WebRTC".into(), json!({ "publicIP": ip }));
+        dynamic.insert("WebRTCLocalAddress".into(), Value::String(ip.into()));
+        dynamic.insert("WebRTCAddress".into(), Value::String(ip.into()));
     }
 
     let webgl_config = json!({
