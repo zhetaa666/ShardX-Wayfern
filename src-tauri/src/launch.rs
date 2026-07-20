@@ -43,9 +43,9 @@ pub async fn launch_profile(
     enable_cdp: bool,
     headless: bool,
 ) -> Result<LaunchOutcome> {
-    let bin = resolve_binary()?;
     let stored = profile::load_raw(profile_id)?;
-    let udd = profile::user_data_dir(profile_id)?;
+    let engine = profile::normalize_browser_engine(&stored.meta.browser_engine);
+    let udd = profile::engine_user_data_dir(profile_id, engine)?;
 
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
     let bound_proxy: Option<proxy::ProxyEntry> = stored
@@ -70,12 +70,30 @@ pub async fn launch_profile(
     // Strip `_meta` wrapper and resolve "auto" sentinels before serialising.
     let mut raw = stored.config.clone();
     raw.remove("_meta");
-    let auto_geo = resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
+    let cached_geo = bound_proxy
+        .as_ref()
+        .and_then(|p| proxy::latest_test(&p.id))
+        .and_then(snapshot_geo);
+    let auto_geo = resolve_auto_fields(&mut raw, bound_proxy.as_ref(), cached_geo.as_ref());
+    let effective_geo = auto_geo.as_ref().or(cached_geo.as_ref());
     let json = serde_json::to_string(&raw).context("serialize profile")?;
+    let public_ip = effective_geo.map(|g| g.ip.as_str());
 
-    // Pass fingerprint by file path — inline JSON overflows Windows' 32767-char CreateProcess limit.
-    let fp_file = udd.join("fingerprint.json");
-    std::fs::write(&fp_file, &json).context("write fingerprint.json")?;
+    let (bin, mut engine_args) = if engine == profile::ENGINE_IXBROWSER_145 {
+        let config = crate::ixbrowser::build_launch_config(
+            profile_id,
+            &raw,
+            &udd,
+            effective_geo,
+            public_ip,
+        )?;
+        (config.binary, config.args)
+    } else {
+        // Pass fingerprint by file path — inline JSON overflows Windows' 32767-char CreateProcess limit.
+        let fp_file = udd.join("fingerprint.json");
+        std::fs::write(&fp_file, &json).context("write fingerprint.json")?;
+        (resolve_binary()?, vec![format!("--fingerprint-profile={}", fp_file.display())])
+    };
 
     // Pre-warm Widevine CDM to avoid first-DRM-page component-updater stall.
     if let Err(e) = install_widevine(&udd) {
@@ -83,7 +101,12 @@ pub async fn launch_profile(
     }
 
     let mut cmd = tokio::process::Command::new(&bin);
-    cmd.arg(format!("--fingerprint-profile={}", fp_file.display()));
+    if engine == profile::ENGINE_IXBROWSER_145 {
+        if let Some(parent) = bin.parent() {
+            cmd.current_dir(parent);
+        }
+    }
+    cmd.args(engine_args.drain(..));
     cmd.arg(format!("--user-data-dir={}", udd.display()));
     cmd.arg("--no-first-run");
 
@@ -102,7 +125,7 @@ pub async fn launch_profile(
     if keep_cdp_active {
         disabled_features.push("CalculateNativeWinOcclusion");
     }
-    if !disabled_features.is_empty() {
+    if !disabled_features.is_empty() && engine != profile::ENGINE_IXBROWSER_145 {
         cmd.arg(format!("--disable-features={}", disabled_features.join(",")));
     }
     if keep_cdp_active {
@@ -142,8 +165,7 @@ pub async fn launch_profile(
     // Never a live lookup here — launch already cost one geo round-trip at
     // most, and hammering the proxy at spawn slows concurrent sessions.
     let proxy_public_ip: Option<String> = if bound_proxy.is_some() {
-        auto_geo
-            .as_ref()
+        effective_geo
             .map(|g| g.ip.clone())
             .filter(|ip| !ip.is_empty())
             .or_else(|| latest.as_ref().map(|s| s.ip.clone()).filter(|ip| !ip.is_empty()))
@@ -153,14 +175,18 @@ pub async fn launch_profile(
     match webrtc_mode {
         "block" => {
             cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
-            cmd.arg("--shardx-webrtc-policy=block");
+            if engine != profile::ENGINE_IXBROWSER_145 {
+                cmd.arg("--shardx-webrtc-policy=block");
+            }
             eprintln!("[launcher] WebRTC blocked (servers stripped, relay-only, UDP off)");
         }
         "tcp_only" => {
             cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
-            cmd.arg("--shardx-webrtc-policy=tcp_only");
-            if let Some(ip) = proxy_public_ip.as_deref() {
-                cmd.arg(format!("--shardx-webrtc-public-ip={ip}"));
+            if engine != profile::ENGINE_IXBROWSER_145 {
+                cmd.arg("--shardx-webrtc-policy=tcp_only");
+                if let Some(ip) = proxy_public_ip.as_deref() {
+                    cmd.arg(format!("--shardx-webrtc-public-ip={ip}"));
+                }
             }
             eprintln!("[launcher] WebRTC: TCP-only (servers stripped, mDNS host only, UDP off)");
         }
@@ -172,9 +198,11 @@ pub async fn launch_profile(
                 eprintln!("[launcher] WebRTC auto -> native (no proxy bound)");
             } else if !proxy_udp_ok {
                 cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
-                cmd.arg("--shardx-webrtc-policy=tcp_only");
-                if let Some(ip) = proxy_public_ip.as_deref() {
-                    cmd.arg(format!("--shardx-webrtc-public-ip={ip}"));
+                if engine != profile::ENGINE_IXBROWSER_145 {
+                    cmd.arg("--shardx-webrtc-policy=tcp_only");
+                    if let Some(ip) = proxy_public_ip.as_deref() {
+                        cmd.arg(format!("--shardx-webrtc-public-ip={ip}"));
+                    }
                 }
                 eprintln!("[launcher] WebRTC auto -> TCP-only (no proxied UDP available)");
             } else {
@@ -185,7 +213,9 @@ pub async fn launch_profile(
 
     // Screen resolution mode: presence-only switch to use host monitor.
     let s = settings::load()?;
-    if s.screen_resolution_mode.as_deref() == Some("real") {
+    if s.screen_resolution_mode.as_deref() == Some("real")
+        && engine != profile::ENGINE_IXBROWSER_145
+    {
         cmd.arg("--shardx-real-screen");
     }
 
@@ -256,12 +286,30 @@ async fn read_devtools_endpoint(udd: &Path) -> Option<process::CdpInfo> {
     None
 }
 
-/// Resolve "auto" sentinels in profile JSON; with proxy: live → cached → country tag → host warn.
-/// Returns the geo info it used (if any) so the caller can reuse it (e.g. for
-/// the WebRTC public-IP flag) without a second network round-trip.
-async fn resolve_auto_fields(
+fn snapshot_geo(snap: proxy::TestSnapshot) -> Option<proxy::GeoInfo> {
+    if snap.country_code.is_empty() && snap.timezone.is_empty() && snap.ip.is_empty() {
+        return None;
+    }
+    Some(proxy::GeoInfo {
+        ip: snap.ip,
+        country: snap.country,
+        country_code: snap.country_code,
+        region: snap.region,
+        city: snap.city,
+        isp: snap.isp,
+        timezone: snap.timezone,
+        latitude: snap.latitude,
+        longitude: snap.longitude,
+        provider: snap.provider,
+    })
+}
+
+/// Resolve auto fields from the cached proxy test. Normal launch never probes
+/// the proxy or a geo provider; untested proxies fall back to their country tag.
+fn resolve_auto_fields(
     cfg: &mut serde_json::Map<String, serde_json::Value>,
     proxy_opt: Option<&proxy::ProxyEntry>,
+    cached_geo: Option<&proxy::GeoInfo>,
 ) -> Option<proxy::GeoInfo> {
     let want_tz_auto = cfg.get("timezone").and_then(|v| v.as_str()) == Some("auto");
     let want_lang_auto = cfg
@@ -287,67 +335,24 @@ async fn resolve_auto_fields(
     );
 
     // ---- geo source ----
-    // Cached-first: the proxy's last full-test snapshot already carries
-    // ip/tz/locale/lat-lng, so reuse it and skip the live round-trip.  A live
-    // geo_check per launch adds seconds of latency and — with several
-    // profiles starting in a batch — piles concurrent requests onto the
-    // proxy exactly when the first sessions begin browsing.  Live lookup
-    // remains the fallback for never-tested proxies.
-    let mut source = "";
-    let geo: Option<proxy::GeoInfo> = match proxy_opt {
-        Some(p) => {
-            let cached = proxy::latest_test(&p.id).and_then(|snap| {
-                if !snap.country_code.is_empty() || !snap.timezone.is_empty() {
-                    Some(proxy::GeoInfo {
-                        ip: snap.ip,
-                        country: snap.country,
-                        country_code: snap.country_code,
-                        region: snap.region,
-                        city: snap.city,
-                        isp: snap.isp,
-                        timezone: snap.timezone,
-                        latitude: snap.latitude,
-                        longitude: snap.longitude,
-                        provider: snap.provider,
-                    })
-                } else {
-                    None
-                }
-            });
-            match cached {
-                Some(g) => { source = "cached-snapshot"; Some(g) }
-                None => match proxy::geo_check_via(Some(p), None).await {
-                    Ok(g) => { source = "proxy-live"; Some(g) }
-                    Err(e) => {
-                        eprintln!("[launcher] proxy geo failed: {e} — falling back to country tag");
-                        if !p.country.is_empty() {
-                            source = "country-tag";
-                            Some(proxy::GeoInfo {
-                                ip: String::new(),
-                                country: String::new(),
-                                country_code: p.country.clone(),
-                                region: String::new(),
-                                city: String::new(),
-                                isp: String::new(),
-                                timezone: String::new(),
-                                latitude: 0.0,
-                                longitude: 0.0,
-                                provider: String::new(),
-                            })
-                        } else { None }
-                    }
-                },
-            }
-        }
-        None => {
-            match proxy::geo_check_via(None, None).await {
-                Ok(g) => { source = "direct-live"; Some(g) }
-                Err(e) => {
-                    eprintln!("[launcher] direct geo failed: {e} — falling back to host TZ/locale");
-                    None
-                }
-            }
-        }
+    let (source, geo): (&str, Option<proxy::GeoInfo>) = match (cached_geo, proxy_opt) {
+        (Some(g), _) => ("cached-snapshot", Some(g.clone())),
+        (None, Some(p)) if !p.country.is_empty() => (
+            "country-tag",
+            Some(proxy::GeoInfo {
+                ip: String::new(),
+                country: String::new(),
+                country_code: p.country.clone(),
+                region: String::new(),
+                city: String::new(),
+                isp: String::new(),
+                timezone: String::new(),
+                latitude: 0.0,
+                longitude: 0.0,
+                provider: String::new(),
+            }),
+        ),
+        _ => ("host", None),
     };
 
     let host_warn = || {

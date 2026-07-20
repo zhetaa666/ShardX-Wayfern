@@ -4,12 +4,28 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+pub const ENGINE_SHARDX: &str = "shardx";
+pub const ENGINE_IXBROWSER_145: &str = "ixbrowser-145";
+
+fn default_browser_engine() -> String {
+    ENGINE_SHARDX.into()
+}
+
+pub fn normalize_browser_engine(engine: &str) -> &'static str {
+    if engine == ENGINE_IXBROWSER_145 {
+        ENGINE_IXBROWSER_145
+    } else {
+        ENGINE_SHARDX
+    }
+}
+
 /// Launcher-side view of a profile (wraps raw FingerprintConfig JSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileMeta {
     pub id: String,
     pub name: String,
     pub notes: String,
+    pub browser_engine: String,
     pub proxy_id: Option<String>,
     pub last_launched_at: Option<String>,
     pub created_at: Option<String>,
@@ -35,6 +51,8 @@ pub struct StoredProfile {
 pub struct StoredMeta {
     #[serde(default)]
     pub id: String,
+    #[serde(default = "default_browser_engine")]
+    pub browser_engine: String,
     #[serde(default)]
     pub proxy_id: Option<String>,
     #[serde(default)]
@@ -91,6 +109,8 @@ pub fn list_all() -> Result<Vec<ProfileMeta>> {
             continue;
         }
         // Backfill legacy profiles' created_at from file mtime, then persist.
+        // Do not rewrite merely to add the default browser engine: serde's
+        // default keeps old profile files untouched until their next real edit.
         if stored.meta.created_at.is_none() {
             let mtime = entry
                 .metadata()
@@ -121,6 +141,7 @@ pub fn list_all() -> Result<Vec<ProfileMeta>> {
             id: stored.meta.id,
             name,
             notes,
+            browser_engine: normalize_browser_engine(&stored.meta.browser_engine).into(),
             proxy_id: stored.meta.proxy_id,
             last_launched_at: stored.meta.last_launched_at,
             created_at: stored.meta.created_at,
@@ -249,6 +270,11 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
             if stored.meta.last_launched_at.is_none() {
                 stored.meta.last_launched_at = existing.meta.last_launched_at;
             }
+            // A launched profile's engine is immutable: changing it would point
+            // the same logical profile at a different Chromium storage tree.
+            if existing.meta.last_launched_at.is_some() {
+                stored.meta.browser_engine = existing.meta.browser_engine;
+            }
             // total_runtime_ms is owned by the Tracker — every save (edit /
             // proxy bind / folder move) carries the existing counter through.
             if stored.meta.total_runtime_ms == 0 {
@@ -334,6 +360,7 @@ pub fn clone_profile(id: &str) -> Result<ProfileMeta> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        browser_engine: normalize_browser_engine(&src.meta.browser_engine).into(),
         proxy_id: src.meta.proxy_id,
         last_launched_at: None,
         created_at: src.meta.created_at,
@@ -421,7 +448,8 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<Vec<String>> {
     Ok(affected)
 }
 
-/// Per-profile user-data-dir; created on first call.
+/// Existing ShardX profiles keep their original directory. Compatibility
+/// engines live below that directory so Chromium versions never share state.
 pub fn user_data_dir(id: &str) -> Result<PathBuf> {
     if id.contains(['/', '\\', '.']) {
         anyhow::bail!("invalid profile id");
@@ -429,6 +457,22 @@ pub fn user_data_dir(id: &str) -> Result<PathBuf> {
     let p = store::user_data_root()?.join(id);
     std::fs::create_dir_all(&p)?;
     Ok(p)
+}
+
+pub fn engine_user_data_dir(id: &str, engine: &str) -> Result<PathBuf> {
+    let root = user_data_dir(id)?;
+    let p = if normalize_browser_engine(engine) == ENGINE_IXBROWSER_145 {
+        root.join(ENGINE_IXBROWSER_145)
+    } else {
+        root
+    };
+    std::fs::create_dir_all(&p)?;
+    Ok(p)
+}
+
+pub fn profile_user_data_dir(id: &str) -> Result<PathBuf> {
+    let stored = load_raw(id)?;
+    engine_user_data_dir(id, &stored.meta.browser_engine)
 }
 
 fn chrono_now_iso() -> String {

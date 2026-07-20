@@ -3,6 +3,7 @@
 mod api;
 mod cookies;
 mod fingerprints;
+mod ixbrowser;
 mod launch;
 mod mcp_setup;
 mod process;
@@ -451,6 +452,12 @@ pub fn save_profile_core(
 
     let mut stored: profile::StoredProfile =
         serde_json::from_value(payload).map_err(|e| e.to_string())?;
+    if is_new
+        && profile::normalize_browser_engine(&stored.meta.browser_engine)
+            == profile::ENGINE_IXBROWSER_145
+    {
+        crate::ixbrowser::resolve_binary().map_err(|e| e.to_string())?;
+    }
     profile::save_raw(&mut stored).map_err(|e| e.to_string())?;
     let name = stored
         .config
@@ -468,6 +475,7 @@ pub fn save_profile_core(
         id: stored.meta.id,
         name,
         notes,
+        browser_engine: profile::normalize_browser_engine(&stored.meta.browser_engine).into(),
         proxy_id: stored.meta.proxy_id,
         last_launched_at: stored.meta.last_launched_at,
         created_at: stored.meta.created_at,
@@ -1391,6 +1399,8 @@ pub fn run() {
             mcp_download,
             runtime::runtime_status,
             runtime::runtime_install,
+            ixbrowser::ixbrowser_status,
+            ixbrowser::ixbrowser_install,
             runtime::launcher_update_check,
             wayfern::wayfern_status,
             wayfern::wayfern_install,

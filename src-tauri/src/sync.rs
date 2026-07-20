@@ -487,7 +487,7 @@ fn collect_local(s: &settings::Settings) -> Result<Vec<SyncItem>> {
             out.push(SyncItem {
                 kind: "cookies".into(),
                 id: meta.id.clone(),
-                updated_at: mtime_marker(&profile::user_data_dir(&meta.id)?.join("Default").join("Network").join("Cookies")),
+                updated_at: mtime_marker(&profile::profile_user_data_dir(&meta.id)?.join("Default").join("Network").join("Cookies")),
                 deleted_at: None,
                 device_id: device.clone(),
                 revision: 0,
@@ -872,7 +872,7 @@ pub async fn sync_periodic_tick() {
 }
 
 fn storage_updated_at(profile_id: &str) -> Result<String> {
-    let udd = profile::user_data_dir(profile_id)?;
+    let udd = profile::profile_user_data_dir(profile_id)?;
     let mut latest = String::from("@0");
     for path in storage_paths(&udd) {
         let marker = mtime_marker(&path);
@@ -903,7 +903,7 @@ pub fn export_storage_bundle(profile_id: &str) -> Result<Vec<u8>> {
     if process::Tracker::shared().is_running(profile_id) {
         return Err(anyhow!("stop the profile before exporting storage"));
     }
-    let udd = profile::user_data_dir(profile_id)?;
+    let udd = profile::profile_user_data_dir(profile_id)?;
     let enc = GzEncoder::new(Vec::new(), Compression::fast());
     let mut tar = tar::Builder::new(enc);
     for path in storage_paths(&udd) {
@@ -922,7 +922,7 @@ pub fn import_storage_bundle(profile_id: &str, bytes: &[u8]) -> Result<()> {
     if process::Tracker::shared().is_running(profile_id) {
         return Err(anyhow!("stop the profile before importing storage"));
     }
-    let udd = profile::user_data_dir(profile_id)?;
+    let udd = profile::profile_user_data_dir(profile_id)?;
     let dec = GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(dec);
     archive.unpack(udd)?;

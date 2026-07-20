@@ -813,6 +813,11 @@ components:
       properties:
         name: { type: string }
         notes: { type: string }
+        browser_engine:
+          type: string
+          enum: [shardx, ixbrowser-145]
+          default: shardx
+          description: Per-profile Chromium base. `ixbrowser-145` is Windows-only and requires a locally configured binary.
         proxy_id:
           type: string
           description: Bind a proxy already in the store (by id).
@@ -872,6 +877,7 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         notes: { type: string }
+        browser_engine: { type: string, enum: [shardx, ixbrowser-145], default: shardx }
         proxy_id: { type: string, nullable: true }
         last_launched_at: { type: string, nullable: true, description: ISO-8601 or null. }
         created_at: { type: string, nullable: true }
@@ -901,6 +907,7 @@ components:
           type: object
           properties:
             id: { type: string, format: uuid }
+            browser_engine: { type: string, enum: [shardx, ixbrowser-145], default: shardx }
             proxy_id: { type: string, nullable: true }
             inline_proxy:
               nullable: true
@@ -933,6 +940,7 @@ components:
       type: object
       properties:
         profile_id: { type: string }
+        browser_engine: { type: string, enum: [shardx, ixbrowser-145] }
         pid: { type: integer, format: int64 }
         cdp:
           nullable: true
