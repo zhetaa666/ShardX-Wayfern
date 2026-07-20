@@ -709,6 +709,27 @@ pub fn latest_test(proxy_id: &str) -> Option<TestSnapshot> {
         .and_then(|hs| hs.by_proxy.get(proxy_id).and_then(|v| v.last().cloned()))
 }
 
+pub fn snapshot_has_geo(snap: &TestSnapshot) -> bool {
+    !snap.ip.is_empty()
+        && !snap.country_code.is_empty()
+        && !snap.timezone.is_empty()
+        && snap.latitude != 0.0
+        && snap.longitude != 0.0
+}
+
+pub async fn ensure_cached_geo(entry: &ProxyEntry) -> Result<TestSnapshot> {
+    if let Some(snapshot) = latest_test(&entry.id).filter(snapshot_has_geo) {
+        return Ok(snapshot);
+    }
+    let snapshot = full_test(entry).await?;
+    if !snapshot_has_geo(&snapshot) {
+        anyhow::bail!(
+            "proxy test did not return complete GeoIP data; verify the proxy and geo checker"
+        );
+    }
+    Ok(snapshot)
+}
+
 fn unix_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let s = SystemTime::now()
