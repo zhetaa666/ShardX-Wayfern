@@ -189,7 +189,7 @@ function StarModal() {
 
 // ---- context menu ----
 
-type ContextItem = { label: string; onClick: () => void; danger?: boolean; sep?: boolean };
+type ContextItem = { label: string; onClick: () => void; danger?: boolean; sep?: boolean; disabled?: boolean; title?: string };
 function useContextMenu() {
   const [menu, setMenu] = useState<{ x: number; y: number; items: ContextItem[] } | null>(null);
   const close = () => setMenu(null);
@@ -234,6 +234,8 @@ function useContextMenu() {
           <button
             key={i}
             className={`ctx-item ${it.danger ? "ctx-danger" : ""}`}
+            disabled={it.disabled}
+            title={it.title}
             onClick={() => { it.onClick(); close(); }}
           >
             {it.label}
@@ -1153,6 +1155,9 @@ function BrowsersView() {
   const profileSyncLocked = (id: string) =>
     syncRuntime.active && (syncRuntime.locked_profiles.length === 0 || syncRuntime.locked_profiles.includes(id));
   const syncLockMessage = syncRuntime.message || "Sync in progress";
+  const runningLockMessage = "Stop the profile before editing";
+  const profileEditLocked = (id: string) => !!running[id] || profileSyncLocked(id);
+  const profileEditLockMessage = (id: string) => running[id] ? runningLockMessage : syncLockMessage;
 
   const reload = async () => {
     try {
@@ -1169,15 +1174,18 @@ function BrowsersView() {
     invoke<FingerprintEntry[]>("fingerprint_list").then(setFingerprints).catch((e) => toast.err(String(e)));
   }, []);
 
-  // Backend emits this when pull-before-Start fails but we launch anyway
-  // (robust-offline path). Surface it as an info toast, don't block.
+  // Cloud failures never discard a local edit or block an offline launch.
   useEffect(() => {
-    let un: (() => void) | undefined;
     let disposed = false;
-    listen<{ profile_id: string; message: string }>("launch-warning", (e) => {
-      toast.info(e.payload.message);
-    }).then((fn) => { if (disposed) fn(); else un = fn; });
-    return () => { disposed = true; un?.(); };
+    const unlisteners: (() => void)[] = [];
+    const attach = (event: "launch-warning" | "profile-sync-warning") => {
+      listen<{ profile_id: string; message: string }>(event, (e) => {
+        toast.info(e.payload.message);
+      }).then((fn) => { if (disposed) fn(); else unlisteners.push(fn); });
+    };
+    attach("launch-warning");
+    attach("profile-sync-warning");
+    return () => { disposed = true; unlisteners.forEach((fn) => fn()); };
   }, []);
 
   // Scroll the expanded editor into view after expand animation.
@@ -1197,6 +1205,18 @@ function BrowsersView() {
   // its persisted `total_runtime_ms` — re-fetch profile_list so the Time
   // column reflects the new total (otherwise it shows whatever was on
   // disk before this session started, looking like a "reset").
+  const expandedStarted = !!(expanded && expanded !== "__new__" && running[expanded]);
+  const quickEditStarted = !!(quickEdit && running[quickEdit.profile.id]);
+  const folderEditStarted = !!(folderModal?.profileId && running[folderModal.profileId]);
+  useEffect(() => {
+    if (expandedStarted) {
+      setExpanded(null);
+      setDraft(null);
+    }
+    if (quickEditStarted) setQuickEdit(null);
+    if (folderEditStarted) setFolderModal(null);
+  }, [expandedStarted, quickEditStarted, folderEditStarted]);
+
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
@@ -1321,7 +1341,7 @@ function BrowsersView() {
   };
 
   const remove = async (id: string) => {
-    if (profileSyncLocked(id)) { toast.info(syncLockMessage); return; }
+    if (profileEditLocked(id)) { toast.info(profileEditLockMessage(id)); return; }
     if ((await confirmModal({ title: "Delete profile", message: "Delete this profile? Its user-data dir is wiped too.", danger: true })) !== true) return;
     await invoke("profile_delete", { id });
     reload();
@@ -1368,25 +1388,29 @@ function BrowsersView() {
   };
 
   // Per-profile action menu shared by right-click and ⋮ button.
-  const profileMenu = (p: ProfileMeta) => [
-    { label: running[p.id] ? "Stop" : "Launch", onClick: () => startStop(p) },
-    { label: "Edit", onClick: () => expand(p.id) },
-    { label: "Clone", onClick: () => cloneProfile(p.id) },
-    { label: p.pinned ? "Unpin" : "Pin to top", onClick: () => togglePin(p) },
-    { sep: true, label: "", onClick: () => {} },
-    { label: "Move to folder…", onClick: () => setFolderModal({ profileId: p.id }) },
-    ...(p.folder
-      ? [{ label: "Remove from folder", onClick: () => setProfileFolder(p.id, "") }]
-      : []),
-    { sep: true, label: "", onClick: () => {} },
-    { label: "Export cookies", onClick: () => exportCookies(p) },
-    { label: "Import cookies", onClick: () => importCookies(p) },
-    { sep: true, label: "", onClick: () => {} },
-    { label: "Delete", onClick: () => remove(p.id), danger: true },
-  ];
+  const profileMenu = (p: ProfileMeta): ContextItem[] => {
+    const locked = profileEditLocked(p.id);
+    const lockTitle = locked ? profileEditLockMessage(p.id) : undefined;
+    return [
+      { label: running[p.id] ? "Stop" : "Launch", onClick: () => startStop(p) },
+      { label: "Edit", onClick: () => expand(p.id), disabled: locked, title: lockTitle },
+      { label: "Clone", onClick: () => cloneProfile(p.id), disabled: profileSyncLocked(p.id), title: profileSyncLocked(p.id) ? syncLockMessage : undefined },
+      { label: p.pinned ? "Unpin" : "Pin to top", onClick: () => togglePin(p), disabled: locked, title: lockTitle },
+      { sep: true, label: "", onClick: () => {} },
+      { label: "Move to folder…", onClick: () => setFolderModal({ profileId: p.id }), disabled: locked, title: lockTitle },
+      ...(p.folder
+        ? [{ label: "Remove from folder", onClick: () => setProfileFolder(p.id, ""), disabled: locked, title: lockTitle }]
+        : []),
+      { sep: true, label: "", onClick: () => {} },
+      { label: "Export cookies", onClick: () => exportCookies(p) },
+      { label: "Import cookies", onClick: () => importCookies(p), disabled: locked, title: lockTitle },
+      { sep: true, label: "", onClick: () => {} },
+      { label: "Delete", onClick: () => remove(p.id), danger: true, disabled: locked, title: lockTitle },
+    ];
+  };
 
   const togglePin = async (p: ProfileMeta) => {
-    if (profileSyncLocked(p.id)) { toast.info(syncLockMessage); return; }
+    if (profileEditLocked(p.id)) { toast.info(profileEditLockMessage(p.id)); return; }
     try {
       await invoke("profile_set_pin", { id: p.id, pinned: !p.pinned });
       reload();
@@ -1394,7 +1418,7 @@ function BrowsersView() {
   };
 
   const setProfileFolder = async (id: string, f: string) => {
-    if (profileSyncLocked(id)) { toast.info(syncLockMessage); return; }
+    if (profileEditLocked(id)) { toast.info(profileEditLockMessage(id)); return; }
     // Dropping a profile onto the folder it already lives in is a no-op —
     // tell the user instead of silently doing nothing.
     const p = profiles.find((x) => x.id === id);
@@ -1411,7 +1435,10 @@ function BrowsersView() {
   };
 
   const deleteFolder = async (f: string) => {
-    const count = profiles.filter((p) => p.folder === f).length;
+    const folderProfiles = profiles.filter((p) => p.folder === f);
+    const locked = folderProfiles.find((p) => profileEditLocked(p.id));
+    if (locked) { toast.info(profileEditLockMessage(locked.id)); return; }
+    const count = folderProfiles.length;
     // Three outcomes: delete profiles, unfile, cancel.
     const choice = await confirmModal({
       title: `Delete folder “${f}”`,
@@ -1468,16 +1495,16 @@ function BrowsersView() {
   };
 
   const bulkDelete = async () => {
-    const ids = [...selected].filter((id) => !profileSyncLocked(id));
+    const ids = [...selected].filter((id) => !profileEditLocked(id));
     const skipped = selected.size - ids.length;
-    if (ids.length === 0) { if (skipped > 0) toast.info(syncLockMessage); return; }
+    if (ids.length === 0) { if (skipped > 0) toast.info("Stop running profiles and wait for sync before deleting"); return; }
     if ((await confirmModal({ title: "Delete profiles", message: `Delete ${ids.length} profile${ids.length === 1 ? "" : "s"}? This wipes their user-data dirs too.`, danger: true })) !== true) return;
     for (const id of ids) {
       try { await invoke("profile_delete", { id }); } catch (e) { toast.err(String(e)); }
     }
     setSelected(new Set());
     reload();
-    toast.ok(`Deleted ${ids.length}${skipped > 0 ? `, skipped ${skipped} syncing` : ""}`);
+    toast.ok(`Deleted ${ids.length}${skipped > 0 ? `, skipped ${skipped} locked/running` : ""}`);
   };
 
   /// Dump selected profile FingerprintConfigs as a JSON array to clipboard.
@@ -1505,7 +1532,7 @@ function BrowsersView() {
   };
 
   const expand = async (id: string) => {
-    if (profileSyncLocked(id)) { toast.info(syncLockMessage); return; }
+    if (profileEditLocked(id)) { toast.info(profileEditLockMessage(id)); return; }
     if (expanded === id) { setExpanded(null); setDraft(null); return; }
     const stored = await invoke<any>("profile_get", { id });
     setDraft(fromStored(stored));
@@ -1520,12 +1547,11 @@ function BrowsersView() {
 
   const saveDraft = async () => {
     if (!draft) return;
-    if (draft.id && profileSyncLocked(draft.id)) { toast.info(syncLockMessage); return; }
+    if (draft.id && profileEditLocked(draft.id)) { toast.info(profileEditLockMessage(draft.id)); return; }
     if (!draft.id && syncRuntime.active && syncRuntime.locked_profiles.length === 0) { toast.info(syncLockMessage); return; }
     try {
       const fp = fingerprints.find((g) => g.id === draft.gpu_preset_id) ?? null;
       const saved = await invoke<ProfileMeta>("profile_save", { payload: toStored(draft, fp) });
-      await invoke("profile_bind_proxy", { profileId: saved.id, proxyId: draft.proxy_id });
       // A profile created while a folder tab is active should land in that
       // folder (otherwise it pops into "All" and the user has to drag it
       // back themselves).  `__new__` test scopes this to creations only —
@@ -1758,7 +1784,7 @@ function BrowsersView() {
               key={p.id}
               className={`row-wrap ${isRunning ? "row-running" : ""} ${isSyncLocked ? "row-syncing" : ""} ${isExpanded ? "row-expanded" : ""} ${p.pinned ? "row-pinned" : ""}`}
               onContextMenu={(e) => ctx.open(e, profileMenu(p))}
-              draggable={!isExpanded && !isSyncLocked}
+              draggable={!isExpanded && !isRunning && !isSyncLocked}
               onDragStart={(e) => {
                 e.dataTransfer.effectAllowed = "move";
                 // Set BOTH a custom MIME (so non-folder drop zones can ignore
@@ -1788,7 +1814,7 @@ function BrowsersView() {
                 <div>
                   <input type="checkbox" checked={isSel} onChange={() => toggleSel(p.id)} />
                 </div>
-                <div className="cell-name" onClick={() => !isSyncLocked && expand(p.id)}>
+                <div className="cell-name" onClick={() => !isRunning && !isSyncLocked && expand(p.id)} title={isRunning ? runningLockMessage : isSyncLocked ? syncLockMessage : "Edit profile"}>
                   <div className="name-main">
                     {p.pinned && <span className="pin-mark" title="Pinned"><Icon.Pin2 /></span>}
                     {p.name}
@@ -1810,7 +1836,7 @@ function BrowsersView() {
                     </span>
                   )}
                 </div>
-                <div className="cell-click" onClick={() => !isSyncLocked && setQuickEdit({ kind: "proxy", profile: p })} title={isSyncLocked ? syncLockMessage : "Change proxy"}>
+                <div className="cell-click" onClick={() => !isRunning && !isSyncLocked && setQuickEdit({ kind: "proxy", profile: p })} title={isRunning ? runningLockMessage : isSyncLocked ? syncLockMessage : "Change proxy"}>
                   {px ? (
                     <div className="proxy-cell">
                       <span className={`badge badge-${px.kind}`}>{px.kind}</span>
@@ -1828,8 +1854,8 @@ function BrowsersView() {
                 </div>
                 <div
                   className="cell-notes cell-click"
-                  title={isSyncLocked ? syncLockMessage : (p.notes || "Click to edit notes")}
-                  onClick={() => !isSyncLocked && setQuickEdit({ kind: "notes", profile: p })}
+                  title={isRunning ? runningLockMessage : isSyncLocked ? syncLockMessage : (p.notes || "Click to edit notes")}
+                  onClick={() => !isRunning && !isSyncLocked && setQuickEdit({ kind: "notes", profile: p })}
                 >
                   {p.notes || <span className="muted">—</span>}
                 </div>
@@ -1865,14 +1891,14 @@ function BrowsersView() {
                   <button
                     className={`icon-btn ${p.pinned ? "icon-btn-on" : ""}`}
                     onClick={() => togglePin(p)}
-                    disabled={isSyncLocked}
-                    title={isSyncLocked ? syncLockMessage : (p.pinned ? "Unpin" : "Pin to top")}
+                    disabled={isRunning || isSyncLocked}
+                    title={isRunning ? runningLockMessage : isSyncLocked ? syncLockMessage : (p.pinned ? "Unpin" : "Pin to top")}
                   >
                     <Icon.Pin />
                   </button>
-                  <button className="icon-btn" onClick={() => expand(p.id)} disabled={isSyncLocked} title={isSyncLocked ? syncLockMessage : "Edit"}><Icon.Edit /></button>
+                  <button className="icon-btn" onClick={() => expand(p.id)} disabled={isRunning || isSyncLocked} title={isRunning ? runningLockMessage : isSyncLocked ? syncLockMessage : "Edit"}><Icon.Edit /></button>
                   <button className="icon-btn" onClick={() => cloneProfile(p.id)} disabled={isSyncLocked} title={isSyncLocked ? syncLockMessage : "Clone"}><Icon.Clone /></button>
-                  <button className="icon-btn danger" onClick={() => remove(p.id)} disabled={isSyncLocked} title={isSyncLocked ? syncLockMessage : "Delete"}><Icon.Trash /></button>
+                  <button className="icon-btn danger" onClick={() => remove(p.id)} disabled={isRunning || isSyncLocked} title={isRunning ? runningLockMessage : isSyncLocked ? syncLockMessage : "Delete"}><Icon.Trash /></button>
                   <button
                     className="icon-btn"
                     onClick={(e) => { e.stopPropagation(); ctx.open(e, profileMenu(p)); }}

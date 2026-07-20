@@ -1849,9 +1849,10 @@ button.status-pill.status-link:active { transform: translateY(1px); }
   border-radius: 5px;
   cursor: pointer;
 }
-.ctx-item:hover { background: var(--accent-dim); color: var(--accent-hi); }
+.ctx-item:hover:not(:disabled) { background: var(--accent-dim); color: var(--accent-hi); }
+.ctx-item:disabled { opacity: 0.42; cursor: not-allowed; }
 .ctx-danger { color: var(--err); }
-.ctx-danger:hover { background: #fb71851f; color: var(--err); }
+.ctx-danger:hover:not(:disabled) { background: #fb71851f; color: var(--err); }
 .ctx-sep {
   height: 1px;
   background: var(--bd-1);

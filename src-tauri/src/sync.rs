@@ -427,14 +427,7 @@ async fn sync_inner() -> Result<SyncReport> {
     let c = client();
 
     update_sync("pushing", &format!("Pushing {} local item(s)", local.len()));
-    auth(c.post(format!("{base}/sync/push")), &s.sync_token)
-        .json(&SyncBatch {
-            items: local.clone(),
-            cursor: s.sync_last_cursor.clone(),
-        })
-        .send()
-        .await?
-        .error_for_status()?;
+    push_items(&c, &s, &base, local.clone()).await?;
     // Push succeeded: the server now owns our tombstones, so mark them
     // pushed and purge any that have aged out of the grace window.
     let _ = mark_tombstones_pushed();
@@ -466,22 +459,43 @@ async fn sync_inner() -> Result<SyncReport> {
     })
 }
 
+async fn push_items(
+    c: &reqwest::Client,
+    s: &settings::Settings,
+    base: &str,
+    items: Vec<SyncItem>,
+) -> Result<()> {
+    auth(c.post(format!("{base}/sync/push")), &s.sync_token)
+        .json(&SyncBatch {
+            items,
+            cursor: s.sync_last_cursor.clone(),
+        })
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn profile_item(s: &settings::Settings, profile_id: &str) -> Result<SyncItem> {
+    let path = store::profiles_dir()?.join(format!("{profile_id}.json"));
+    let stored = profile::load_raw(profile_id)?;
+    Ok(SyncItem {
+        kind: "profile".into(),
+        id: profile_id.into(),
+        updated_at: mtime_marker(&path),
+        deleted_at: None,
+        device_id: s.sync_device_id.clone(),
+        revision: 0,
+        payload: serde_json::to_value(stored)?,
+    })
+}
+
 fn collect_local(s: &settings::Settings) -> Result<Vec<SyncItem>> {
     let mut out = Vec::new();
     let device = s.sync_device_id.clone();
 
     for meta in profile::list_all()? {
-        let path = store::profiles_dir()?.join(format!("{}.json", meta.id));
-        let stored = profile::load_raw(&meta.id)?;
-        out.push(SyncItem {
-            kind: "profile".into(),
-            id: meta.id.clone(),
-            updated_at: mtime_marker(&path),
-            deleted_at: None,
-            device_id: device.clone(),
-            revision: 0,
-            payload: serde_json::to_value(stored)?,
-        });
+        out.push(profile_item(s, &meta.id)?);
         if s.sync_include_cookies && !process::Tracker::shared().is_running(&meta.id) {
             let ck = cookies::export(&meta.id).unwrap_or_default();
             out.push(SyncItem {
@@ -690,38 +704,85 @@ pub struct PullReport {
     pub missing: usize,
 }
 
-/// Fetch the latest server copy of a single profile's bundle (config +
-/// cookies + storage) and apply it before launch — the "pull-before-Start"
-/// behaviour of premium antidetect browsers, so the newest login from another
-/// device is reconstructed locally before the browser spawns.
+async fn push_profile_config_inner(
+    s: &settings::Settings,
+    base: &str,
+    profile_id: &str,
+) -> Result<()> {
+    let item = profile_item(s, profile_id)?;
+    push_items(&client(), s, base, vec![item]).await
+}
+
+/// Push a freshly edited profile configuration without collecting cookies,
+/// storage, unrelated profiles, or tombstones. Disabled sync is a no-op.
+pub async fn push_profile_config(profile_id: &str) -> Result<()> {
+    let loaded = settings::load()?;
+    if !loaded.sync_enabled {
+        return Ok(());
+    }
+    let s = ensure_device_id(loaded)?;
+    let base = clean_base_url(s.sync_base_url.as_deref().unwrap_or(""))?;
+    if s.sync_token.trim().is_empty() {
+        return Err(anyhow!("sync token is empty"));
+    }
+
+    begin_sync(
+        "push_profile",
+        Some(profile_id.to_string()),
+        "Saving profile to cloud",
+    )?;
+    let result = push_profile_config_inner(&s, &base, profile_id).await;
+    match &result {
+        Ok(()) => finish_sync(
+            Some(SyncReport {
+                pushed: 1,
+                pulled: 0,
+                skipped: 0,
+                cursor: s.sync_last_cursor.clone(),
+            }),
+            "Profile saved to cloud",
+        ),
+        Err(e) => finish_sync(None, &format!("Profile cloud save failed: {e}")),
+    }
+    result
+}
+
+/// Push the local config, then fetch the latest server copy of the profile's
+/// config, cookies, and storage before launch. The push prevents an older
+/// remote config from undoing a local edit such as a freshly bound proxy.
 ///
-/// Robust offline: a network/server failure returns Err; the caller (launch)
-/// warns but still launches from local data.  A profile that is currently
-/// running locally is left untouched (never clobber a live session).
+/// Robust offline: a push or pull failure returns Err; the caller warns and
+/// launches from local data. A failed push aborts before any remote item is
+/// applied, so an outage can never replace the newer local configuration.
 pub async fn pull_profile(profile_id: &str) -> Result<PullReport> {
     if process::Tracker::shared().is_running(profile_id) {
-        // Live session — nothing to pull, the local copy is the newest.
         return Ok(PullReport::default());
     }
     let s = configured()?;
     let base = clean_base_url(s.sync_base_url.as_deref().unwrap_or(""))?;
 
-    begin_sync("pull_before_launch", Some(profile_id.to_string()), "Loading profile from cloud")?;
-    let result = pull_profile_inner(&s, &base, profile_id).await;
+    begin_sync(
+        "pull_before_launch",
+        Some(profile_id.to_string()),
+        "Saving local profile before cloud load",
+    )?;
+    let result = async {
+        update_sync("pushing_profile", "Saving local profile to cloud");
+        push_profile_config_inner(&s, &base, profile_id).await?;
+        pull_profile_inner(&s, &base, profile_id).await
+    }
+    .await;
     match &result {
         Ok(r) => finish_sync(
-            None,
+            Some(SyncReport {
+                pushed: 1,
+                pulled: r.applied,
+                skipped: r.skipped,
+                cursor: s.sync_last_cursor.clone(),
+            }),
             &format!("Loaded profile (applied {}, skipped {})", r.applied, r.skipped),
         ),
-        Err(e) => finish_sync(None, &format!("Pull failed: {e}")),
-    }
-    // finish_sync marks phase error when no report; overwrite phase to done on
-    // success so the UI banner doesn't read as a failure.
-    if result.is_ok() {
-        if let Ok(mut st) = runtime_state().lock() {
-            st.phase = "done".into();
-            emit_status(&st);
-        }
+        Err(e) => finish_sync(None, &format!("Profile cloud load failed: {e}")),
     }
     result
 }

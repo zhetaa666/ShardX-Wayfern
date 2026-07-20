@@ -95,6 +95,17 @@ fn err(code: StatusCode, msg: impl Into<String>) -> ApiError {
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
+fn profile_mutation_guard(profile_id: &str) -> Result<(), ApiError> {
+    crate::ensure_profile_mutable(profile_id).map_err(|e| err(StatusCode::CONFLICT, e))
+}
+
+fn profiles_mutation_guard(profile_ids: &[String]) -> Result<(), ApiError> {
+    for id in profile_ids {
+        profile_mutation_guard(id)?;
+    }
+    Ok(())
+}
+
 // ---- auth middleware ----
 
 async fn auth(req: Request, next: Next) -> Result<Response, StatusCode> {
@@ -250,6 +261,7 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
 
     let pm = crate::save_profile_core(crate::main_window().as_ref(), Value::Object(cfg), false)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    crate::push_profile_config_best_effort(&pm.id).await;
     crate::notify_store_changed("profiles");
     Ok(Json(serde_json::to_value(pm).unwrap_or(Value::Null)))
 }
@@ -306,6 +318,7 @@ async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
 }
 
 async fn delete_profile(Path(id): Path<String>) -> ApiResult {
+    profile_mutation_guard(&id)?;
     crate::profile::delete(&id).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let _ = crate::sync::record_tombstone("profile", &id);
     crate::notify_store_changed("profiles");
@@ -328,6 +341,7 @@ struct EditReq {
 
 /// Edit profile; only provided fields change. Returns the updated profile.
 async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiResult {
+    profile_mutation_guard(&id)?;
     let mut stored = crate::profile::load_raw(&id)
         .map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
 
@@ -381,6 +395,7 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
 
     let updated = crate::profile::load_raw(&id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::push_profile_config_best_effort(&id).await;
     crate::notify_store_changed("profiles");
     Ok(Json(serde_json::to_value(updated).unwrap_or(Value::Null)))
 }
@@ -391,8 +406,14 @@ struct RenameFolderReq {
 }
 
 async fn rename_folder_ep(Path(folder): Path<String>, Json(body): Json<RenameFolderReq>) -> ApiResult {
+    let affected = crate::profile::ids_in_folder(&folder)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    profiles_mutation_guard(&affected)?;
     let n = crate::profile::rename_folder(&folder, &body.name)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    for id in affected {
+        crate::push_profile_config_best_effort(&id).await;
+    }
     crate::notify_store_changed("profiles");
     Ok(Json(json!({ "renamed_to": body.name, "profiles": n })))
 }
@@ -405,11 +426,18 @@ struct DeleteFolderQuery {
 }
 
 async fn delete_folder_ep(Path(folder): Path<String>, Query(q): Query<DeleteFolderQuery>) -> ApiResult {
+    let profile_ids = crate::profile::ids_in_folder(&folder)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    profiles_mutation_guard(&profile_ids)?;
     let affected = crate::profile::delete_folder(&folder, q.delete_profiles)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if q.delete_profiles {
         for id in &affected {
             let _ = crate::sync::record_tombstone("profile", id);
+        }
+    } else {
+        for id in &affected {
+            crate::push_profile_config_best_effort(id).await;
         }
     }
     crate::notify_store_changed("profiles");
@@ -429,6 +457,14 @@ struct StartReq {
 /// Launch with CDP; body `{ "headless": true }` opt-in.
 async fn start_profile(Path(id): Path<String>, body: Option<Json<StartReq>>) -> ApiResult {
     let headless = body.map(|Json(b)| b.headless).unwrap_or(false);
+    crate::ensure_profile_not_syncing(&id).map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let cfg = crate::settings::load().ok();
+    let sync_on = cfg.as_ref().map(|s| s.sync_enabled).unwrap_or(false);
+    if sync_on && cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
+        if let Err(e) = crate::sync::pull_profile(&id).await {
+            eprintln!("[sync] API pre-launch sync failed for {id}: {e}");
+        }
+    }
     let outcome = crate::launch::launch_profile(&id, true, headless)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

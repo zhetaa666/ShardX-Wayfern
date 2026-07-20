@@ -405,6 +405,14 @@ pub fn set_folder(id: &str, folder: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn ids_in_folder(name: &str) -> Result<Vec<String>> {
+    Ok(list_all()?
+        .into_iter()
+        .filter(|p| p.folder == name)
+        .map(|p| p.id)
+        .collect())
+}
+
 /// Retag profiles from folder `old` to `new`; returns count.
 pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
     let dir = store::profiles_dir()?;

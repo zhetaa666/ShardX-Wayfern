@@ -71,18 +71,57 @@ fn profile_get(id: String) -> Result<Value, String> {
     if stored.meta.gpu_preset_id.is_none() {
         if let Some(gid) = infer_gpu_preset_id(&stored.config) {
             stored.meta.gpu_preset_id = Some(gid);
-            let _ = profile::save_raw(&mut stored);
+            if !is_profile_running(&id) && !sync::is_profile_locked(&id) {
+                let _ = profile::save_raw(&mut stored);
+            }
         }
     }
     serde_json::to_value(stored).map_err(|e| e.to_string())
 }
 
 /// Recover library fingerprint id by matching webgl.renderer (+ screen if ambiguous).
-fn ensure_profile_not_syncing(profile_id: &str) -> Result<(), String> {
+pub(crate) fn ensure_profile_not_syncing(profile_id: &str) -> Result<(), String> {
     if sync::is_profile_locked(profile_id) {
         return Err("profile is syncing; wait until sync finishes".into());
     }
     Ok(())
+}
+
+pub(crate) fn ensure_profile_mutable(profile_id: &str) -> Result<(), String> {
+    ensure_profile_not_syncing(profile_id)?;
+    if process::Tracker::shared().is_running(profile_id) {
+        return Err("stop the profile before editing".into());
+    }
+    Ok(())
+}
+
+fn ensure_profiles_mutable(profile_ids: &[String]) -> Result<(), String> {
+    for id in profile_ids {
+        ensure_profile_mutable(id)?;
+    }
+    Ok(())
+}
+
+fn emit_profile_sync_warning(profile_id: &str, error: &anyhow::Error) {
+    eprintln!("[sync] profile {profile_id} cloud save failed: {error}");
+    if let Some(w) = main_window() {
+        use tauri::Emitter;
+        let _ = w.emit(
+            "profile-sync-warning",
+            serde_json::json!({
+                "profile_id": profile_id,
+                "message": format!(
+                    "Profile saved locally, but cloud sync failed: {error}. It will retry before the next launch."
+                ),
+            }),
+        );
+    }
+}
+
+pub(crate) async fn push_profile_config_best_effort(profile_id: &str) {
+    if let Err(e) = sync::push_profile_config(profile_id).await {
+        emit_profile_sync_warning(profile_id, &e);
+    }
 }
 
 fn ensure_sync_idle() -> Result<(), String> {
@@ -398,17 +437,19 @@ fn clamp_screen_to_real_display(
 }
 
 #[tauri::command]
-fn profile_save(
+async fn profile_save(
     window: tauri::WebviewWindow,
     payload: Value,
 ) -> Result<profile::ProfileMeta, String> {
     if let Some(id) = payload_profile_id(&payload) {
-        ensure_profile_not_syncing(id)?;
+        ensure_profile_mutable(id)?;
     } else {
         ensure_sync_idle()?;
     }
     // UI saves enrich new profiles; the API persists verbatim.
-    save_profile_core(Some(&window), payload, true)
+    let saved = save_profile_core(Some(&window), payload, true)?;
+    push_profile_config_best_effort(&saved.id).await;
+    Ok(saved)
 }
 
 fn is_wayfern_payload(obj: &serde_json::Map<String, Value>) -> bool {
@@ -487,7 +528,7 @@ pub fn save_profile_core(
 
 #[tauri::command]
 fn profile_delete(id: String) -> Result<(), String> {
-    ensure_profile_not_syncing(&id)?;
+    ensure_profile_mutable(&id)?;
     profile::delete(&id).map_err(|e| e.to_string())?;
     // Tombstone so the deletion propagates to other devices on next sync.
     let _ = sync::record_tombstone("profile", &id);
@@ -496,7 +537,7 @@ fn profile_delete(id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Result<(), String> {
-    ensure_profile_not_syncing(&profile_id)?;
+    ensure_profile_mutable(&profile_id)?;
     let mut p = profile::load_raw(&profile_id).map_err(|e| e.to_string())?;
     if let Some(id) = proxy_id.as_deref() {
         let entry = proxy::get(id)
@@ -509,13 +550,17 @@ async fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Res
         }
     }
     p.meta.proxy_id = proxy_id;
-    profile::save_raw(&mut p).map_err(|e| e.to_string())
+    profile::save_raw(&mut p).map_err(|e| e.to_string())?;
+    push_profile_config_best_effort(&profile_id).await;
+    Ok(())
 }
 
 #[tauri::command]
-fn profile_clone(id: String) -> Result<profile::ProfileMeta, String> {
+async fn profile_clone(id: String) -> Result<profile::ProfileMeta, String> {
     ensure_profile_not_syncing(&id)?;
-    profile::clone_profile(&id).map_err(|e| e.to_string())
+    let cloned = profile::clone_profile(&id).map_err(|e| e.to_string())?;
+    push_profile_config_best_effort(&cloned.id).await;
+    Ok(cloned)
 }
 
 /// Import profiles verbatim under fresh ids; returns the count.
@@ -555,37 +600,51 @@ fn clipboard_read(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn profile_set_pin(id: String, pinned: bool) -> Result<(), String> {
-    ensure_profile_not_syncing(&id)?;
-    profile::set_pin(&id, pinned).map_err(|e| e.to_string())
+async fn profile_set_pin(id: String, pinned: bool) -> Result<(), String> {
+    ensure_profile_mutable(&id)?;
+    profile::set_pin(&id, pinned).map_err(|e| e.to_string())?;
+    push_profile_config_best_effort(&id).await;
+    Ok(())
 }
 
 #[tauri::command]
-fn profile_set_folder(id: String, folder: String) -> Result<(), String> {
-    ensure_profile_not_syncing(&id)?;
-    profile::set_folder(&id, &folder).map_err(|e| e.to_string())
+async fn profile_set_folder(id: String, folder: String) -> Result<(), String> {
+    ensure_profile_mutable(&id)?;
+    profile::set_folder(&id, &folder).map_err(|e| e.to_string())?;
+    push_profile_config_best_effort(&id).await;
+    Ok(())
 }
 
 /// Rename folder (retag profiles); returns count.
 #[tauri::command]
-fn folder_rename(old: String, new: String) -> Result<usize, String> {
+async fn folder_rename(old: String, new: String) -> Result<usize, String> {
     ensure_sync_idle()?;
-    profile::rename_folder(&old, &new).map_err(|e| e.to_string())
+    let affected = profile::ids_in_folder(&old).map_err(|e| e.to_string())?;
+    ensure_profiles_mutable(&affected)?;
+    let count = profile::rename_folder(&old, &new).map_err(|e| e.to_string())?;
+    for id in affected {
+        push_profile_config_best_effort(&id).await;
+    }
+    Ok(count)
 }
 
 /// Delete folder; `delete_profiles` true → remove, false → unfile.
 #[tauri::command]
-fn folder_delete(folder: String, delete_profiles: bool) -> Result<usize, String> {
+async fn folder_delete(folder: String, delete_profiles: bool) -> Result<usize, String> {
+    ensure_sync_idle()?;
+    let affected = profile::ids_in_folder(&folder).map_err(|e| e.to_string())?;
+    ensure_profiles_mutable(&affected)?;
+    let changed = profile::delete_folder(&folder, delete_profiles).map_err(|e| e.to_string())?;
     if delete_profiles {
-        ensure_sync_idle()?;
-    }
-    let affected = profile::delete_folder(&folder, delete_profiles).map_err(|e| e.to_string())?;
-    if delete_profiles {
-        for id in &affected {
+        for id in &changed {
             let _ = sync::record_tombstone("profile", id);
         }
+    } else {
+        for id in &changed {
+            push_profile_config_best_effort(id).await;
+        }
     }
-    Ok(affected.len())
+    Ok(changed.len())
 }
 
 /// Host OS in fingerprint-library vocabulary (macOS/Windows/Linux).
@@ -601,12 +660,14 @@ fn host_platform() -> String {
 }
 
 #[tauri::command]
-fn profile_create_from_template(
+async fn profile_create_from_template(
     window: tauri::WebviewWindow,
     template_id: String,
 ) -> Result<profile::ProfileMeta, String> {
     ensure_sync_idle()?;
-    create_from_fingerprint_core(Some(&window), &template_id)
+    let saved = create_from_fingerprint_core(Some(&window), &template_id)?;
+    push_profile_config_best_effort(&saved.id).await;
+    Ok(saved)
 }
 
 /// Merge library fingerprint into fresh profile map; tz/lang/geo set to "auto" sentinel.

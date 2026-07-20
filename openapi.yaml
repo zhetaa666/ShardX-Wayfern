@@ -286,7 +286,7 @@ paths:
     delete:
       tags: [Profiles]
       summary: Delete a profile
-      description: Removes the profile config and its user-data-dir.
+      description: Removes a stopped profile's config and user-data-dir. The profile must not be running or syncing.
       parameters:
         - $ref: "#/components/parameters/ProfileId"
       responses:
@@ -300,6 +300,11 @@ paths:
                   deleted: { type: boolean, example: true }
                   id: { type: string, format: uuid }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: Profile is running or syncing — stop it and wait for sync first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "500":
           description: Deletion failed.
           content:
@@ -313,6 +318,9 @@ paths:
         REPLACES the stored fingerprint verbatim (no re-randomization).
         `folder: ""` unfiles the profile; `proxy_id: ""` unbinds the proxy;
         a `proxy` string is stored (deduped) + full-tested, then bound.
+        The profile must be stopped and not syncing. Changes are saved locally
+        first and pushed to cloud sync immediately on a best-effort basis;
+        launch retries the push before pulling remote profile data.
         Returns the updated stored profile.
       parameters:
         - $ref: "#/components/parameters/ProfileId"
@@ -335,6 +343,11 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           description: No such profile.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Profile is running or syncing — stop it and wait for sync first.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -496,7 +509,7 @@ paths:
     patch:
       tags: [Folders]
       summary: Rename a folder
-      description: Retags every profile in the folder. Returns the count.
+      description: Retags every stopped, non-syncing profile in the folder and pushes each updated config to sync. Returns the count.
       parameters:
         - name: folder
           in: path
@@ -522,12 +535,18 @@ paths:
                   renamed_to: { type: string }
                   profiles: { type: integer, description: Profiles retagged. }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: At least one affected profile is running or syncing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [Folders]
       summary: Delete a folder
       description: |
         Deletes the folder tag. With `delete_profiles=true` the profiles in
-        it are deleted too; otherwise they're unfiled (moved to "All").
+        it are deleted too; otherwise they're unfiled (moved to "All"). All
+        affected profiles must be stopped and not syncing.
       parameters:
         - name: folder
           in: path
@@ -550,6 +569,11 @@ paths:
                   delete_profiles: { type: boolean }
                   profiles: { type: integer, description: Profiles affected. }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: At least one affected profile is running or syncing.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /folders/{folder}/profiles:
     post:
