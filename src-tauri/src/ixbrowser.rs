@@ -370,7 +370,7 @@ pub fn build_launch_config(
             "mobile": false,
             "wow64": false
         },
-        "TTSEngines": raw.pointer("/speech/voices").cloned().unwrap_or_else(|| json!([])),
+        "TTSEngines": raw.get("speech").and_then(|v| v.get("voices")).cloned().unwrap_or_else(|| json!([])),
         "RestoreLastSession": false,
         "AutomationControlled": false,
         "PersistExtensions": "extensionCenter",
@@ -378,7 +378,7 @@ pub fn build_launch_config(
         "DeviceName": device_name(profile_id),
         "ProductType": device_name(profile_id),
         "MinWindowWidth": 100,
-        "JsHeapSizeLimit": raw.pointer("/memory/heap_size_limit").and_then(Value::as_u64).unwrap_or(4_294_967_296).to_string()
+        "JsHeapSizeLimit": raw.get("memory").and_then(|v| v.get("heap_size_limit")).and_then(Value::as_u64).unwrap_or(4_294_967_296).to_string()
     });
 
     let mut dynamic = Map::new();

@@ -267,12 +267,13 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
             if stored.meta.folder.is_empty() {
                 stored.meta.folder = existing.meta.folder;
             }
+            let was_launched = existing.meta.last_launched_at.is_some();
             if stored.meta.last_launched_at.is_none() {
                 stored.meta.last_launched_at = existing.meta.last_launched_at;
             }
             // A launched profile's engine is immutable: changing it would point
             // the same logical profile at a different Chromium storage tree.
-            if existing.meta.last_launched_at.is_some() {
+            if was_launched {
                 stored.meta.browser_engine = existing.meta.browser_engine;
             }
             // total_runtime_ms is owned by the Tracker — every save (edit /
