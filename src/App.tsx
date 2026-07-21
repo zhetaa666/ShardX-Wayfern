@@ -5102,7 +5102,7 @@ function SettingsView() {
     browser_path: null,
     ixbrowser_145_path: null,
     theme: "dark",
-    geo_checker: "ip-api.com",
+    geo_checker: "ixbrowser.com",
     screen_resolution_mode: "fingerprint",
     api_enabled: true,
     api_port: 40325,
@@ -5240,7 +5240,8 @@ function SettingsView() {
         <p className="muted small">Which free public IP-geo service to hit when you press the proxy <strong>Test</strong> button. All three are no-key, rate-limited.</p>
         <label>
           <span className="lbl">Provider</span>
-          <select value={s.geo_checker ?? "ip-api.com"} onChange={(e) => setS({ ...s, geo_checker: e.target.value })}>
+          <select value={s.geo_checker ?? "ixbrowser.com"} onChange={(e) => setS({ ...s, geo_checker: e.target.value })}>
+            <option value="ixbrowser.com">ixbrowser.com (default, HTTPS)</option>
             <option value="ip-api.com">ip-api.com (45 req/min, HTTP)</option>
             <option value="ipapi.co">ipapi.co (1k/day, HTTPS)</option>
             <option value="ipwho.is">ipwho.is (10k/month, HTTPS)</option>

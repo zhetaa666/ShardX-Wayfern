@@ -324,6 +324,7 @@ pub async fn ixbrowser_install(window: Window, force: bool) -> Result<EngineStat
 
 pub fn build_launch_config(
     profile_id: &str,
+    profile_name: &str,
     raw: &Map<String, Value>,
     udd: &Path,
     geo: Option<&proxy::GeoInfo>,
@@ -437,7 +438,7 @@ pub fn build_launch_config(
         "StaticConfig": static_path,
         "DynamicConfig": dynamic_path,
         "WebGLFP": webgl_path,
-        "mark": format!("shardx-{profile_id}"),
+        "mark": profile_name.trim(),
         "DarkMode": false,
         "keep-bgwin-visible": 1
     });

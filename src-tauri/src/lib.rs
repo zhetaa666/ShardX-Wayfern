@@ -446,6 +446,25 @@ async fn profile_save(
     } else {
         ensure_sync_idle()?;
     }
+    if payload
+        .as_object()
+        .map(profile::uses_proxy_auto_fields)
+        .unwrap_or(false)
+    {
+        if let Some(proxy_id) = payload
+            .get("_meta")
+            .and_then(|meta| meta.get("proxy_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            let entry = proxy::get(proxy_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "selected proxy no longer exists".to_string())?;
+            proxy::ensure_cached_geo(&entry).await.map_err(|e| {
+                format!("Proxy GeoIP auto-detection failed: {e}. Test the proxy, then save the profile again.")
+            })?;
+        }
+    }
     // UI saves enrich new profiles; the API persists verbatim.
     let saved = save_profile_core(Some(&window), payload, true)?;
     push_profile_config_best_effort(&saved.id).await;
@@ -866,9 +885,26 @@ fn proxy_list() -> Result<Vec<proxy::ProxyEntry>, String> {
 }
 
 #[tauri::command]
-fn proxy_save(entry: proxy::ProxyEntry) -> Result<proxy::ProxyEntry, String> {
+async fn proxy_save(entry: proxy::ProxyEntry) -> Result<proxy::ProxyEntry, String> {
     ensure_sync_idle()?;
-    proxy::upsert(entry).map_err(|e| e.to_string())
+    let previous = if entry.id.is_empty() {
+        None
+    } else {
+        proxy::get(&entry.id).map_err(|e| e.to_string())?
+    };
+    let saved = proxy::upsert(entry).map_err(|e| e.to_string())?;
+    let connection_changed = previous
+        .as_ref()
+        .map(|old| !old.same_connection(&saved))
+        .unwrap_or(false);
+    if connection_changed {
+        proxy::ensure_cached_geo(&saved).await.map_err(|e| {
+            format!(
+                "Proxy saved, but GeoIP refresh failed: {e}. Test the proxy before launching profiles with automatic GeoIP."
+            )
+        })?;
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
