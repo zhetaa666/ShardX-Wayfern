@@ -501,6 +501,87 @@ fn float_value(value: &serde_json::Value, key: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostPublicIps {
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+fn normalize_ip_list<I>(values: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    let mut addresses = Vec::new();
+    for value in values {
+        for candidate in value.as_ref().split(',') {
+            let candidate = candidate.trim();
+            if candidate.parse::<std::net::IpAddr>().is_ok()
+                && !addresses.iter().any(|existing| existing == candidate)
+            {
+                addresses.push(candidate.to_string());
+            }
+        }
+    }
+    addresses
+}
+
+fn load_host_public_ips() -> Option<HostPublicIps> {
+    let path = store::host_public_ips_path().ok()?;
+    let body = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+pub fn cached_host_public_ips() -> Vec<String> {
+    load_host_public_ips()
+        .map(|cache| normalize_ip_list(cache.addresses))
+        .unwrap_or_default()
+}
+
+fn host_public_ips_cache_is_fresh(cache: &HostPublicIps) -> bool {
+    const MAX_AGE_SECS: u64 = 300;
+    let Some(updated_at) = cache.updated_at.strip_prefix('@') else {
+        return false;
+    };
+    let Ok(updated_at) = updated_at.parse::<u64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(updated_at) <= MAX_AGE_SECS
+}
+
+async fn refresh_host_public_ips() -> Result<Vec<String>> {
+    let geo = geo_check_via(None, None).await?;
+    let addresses = normalize_ip_list([geo.ip]);
+    if addresses.is_empty() {
+        anyhow::bail!("direct GeoIP check did not return a valid public IP address");
+    }
+    let cache = HostPublicIps {
+        addresses: addresses.clone(),
+        updated_at: unix_now(),
+    };
+    fs::write(
+        store::host_public_ips_path()?,
+        serde_json::to_string_pretty(&cache)?,
+    )?;
+    Ok(addresses)
+}
+
+pub async fn ensure_host_public_ips() -> Result<Vec<String>> {
+    if let Some(cache) = load_host_public_ips() {
+        let addresses = normalize_ip_list(&cache.addresses);
+        if !addresses.is_empty() && host_public_ips_cache_is_fresh(&cache) {
+            return Ok(addresses);
+        }
+    }
+    refresh_host_public_ips().await
+}
+
 fn parse_ixbrowser_geo(body: &serde_json::Value, provider: String) -> Result<GeoInfo> {
     if string_value(body, "status") != "success" {
         anyhow::bail!("ixbrowser.com: {}", string_value(body, "message"));
@@ -871,6 +952,12 @@ pub async fn ensure_cached_geo(entry: &ProxyEntry) -> Result<TestSnapshot> {
     Ok(snapshot)
 }
 
+pub async fn ensure_ixbrowser_webrtc(entry: &ProxyEntry) -> Result<TestSnapshot> {
+    let snapshot = ensure_cached_geo(entry).await?;
+    ensure_host_public_ips().await?;
+    Ok(snapshot)
+}
+
 fn unix_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let s = SystemTime::now()
@@ -884,6 +971,7 @@ fn unix_now() -> String {
 pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     let now = unix_now();
 
+    let _ = ensure_host_public_ips().await;
     let tcp_res = probe(entry).await;
     let udp_res = if matches!(entry.kind, ProxyKind::Socks5) {
         Some(probe_udp(entry).await)

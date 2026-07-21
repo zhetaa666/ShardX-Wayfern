@@ -3,6 +3,7 @@ use crate::{
     profile, proxy, settings, store,
 };
 use anyhow::{Context, Result};
+use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -90,7 +91,22 @@ pub async fn launch_profile(
         .unwrap_or("UTC")
         .to_string();
     let json = serde_json::to_string(&raw).context("serialize profile")?;
-    let public_ip = effective_geo.map(|g| g.ip.as_str());
+    let proxy_public_ip = effective_geo
+        .map(|g| g.ip.as_str())
+        .filter(|ip| !ip.is_empty());
+    let host_public_ips = if engine == profile::ENGINE_IXBROWSER_145 && bound_proxy.is_some() {
+        host_source_ips()
+    } else {
+        Vec::new()
+    };
+    if engine == profile::ENGINE_IXBROWSER_145
+        && bound_proxy.is_some()
+        && (proxy_public_ip.is_none() || host_public_ips.is_empty())
+    {
+        anyhow::bail!(
+            "Chromium 145 WebRTC replacement data is incomplete; test or rebind the proxy before launch"
+        );
+    }
     let profile_name = stored
         .config
         .get("name")
@@ -105,7 +121,8 @@ pub async fn launch_profile(
             &raw,
             &udd,
             effective_geo,
-            public_ip,
+            &host_public_ips,
+            proxy_public_ip,
             &resolved_timezone,
         )?;
         (config.binary, config.args)
@@ -314,6 +331,49 @@ async fn read_devtools_endpoint(udd: &Path) -> Option<process::CdpInfo> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     None
+}
+
+fn host_source_ips() -> Vec<String> {
+    let mut addresses = proxy::cached_host_public_ips();
+    for (bind, target) in [
+        ("0.0.0.0:0", "192.0.2.1:9"),
+        ("[::]:0", "[2001:db8::1]:9"),
+    ] {
+        let Ok(socket) = UdpSocket::bind(bind) else {
+            continue;
+        };
+        let Ok(target) = target.parse::<std::net::SocketAddr>() else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        let Ok(local) = socket.local_addr() else {
+            continue;
+        };
+        let ip = local.ip();
+        if is_public_source_ip(ip) {
+            let value = ip.to_string();
+            if !addresses.iter().any(|existing| existing == &value) {
+                addresses.push(value);
+            }
+        }
+    }
+    addresses
+}
+
+fn is_public_source_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified())
+        }
+        IpAddr::V6(ip) => !(ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unspecified()),
+    }
 }
 
 fn snapshot_geo(snap: proxy::TestSnapshot) -> Option<proxy::GeoInfo> {

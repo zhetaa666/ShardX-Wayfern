@@ -3,6 +3,7 @@
 //     profiles/                   ← fingerprint profile JSON files
 //     proxies.json                ← saved proxy list
 //     proxy-cache-keys.json       ← hashed proxy config for GeoIP cache validity
+//     host-public-ips.json        ← device-local source IPs for ixBrowser WebRTC replacement
 //     user-data/<profile-id>/     ← per-profile user-data-dir for ShardX
 //     settings.json               ← global app settings
 
@@ -50,6 +51,10 @@ pub fn proxies_path() -> Result<PathBuf> {
 
 pub fn proxy_cache_keys_path() -> Result<PathBuf> {
     Ok(config_root()?.join("proxy-cache-keys.json"))
+}
+
+pub fn host_public_ips_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("host-public-ips.json"))
 }
 
 pub fn settings_path() -> Result<PathBuf> {

@@ -446,11 +446,18 @@ async fn profile_save(
     } else {
         ensure_sync_idle()?;
     }
-    if payload
+    let engine = payload
+        .get("_meta")
+        .and_then(|meta| meta.get("browser_engine"))
+        .and_then(Value::as_str)
+        .unwrap_or(profile::ENGINE_SHARDX);
+    let needs_ixbrowser_webrtc =
+        profile::normalize_browser_engine(engine) == profile::ENGINE_IXBROWSER_145;
+    let uses_proxy_auto = payload
         .as_object()
         .map(profile::uses_proxy_auto_fields)
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    if uses_proxy_auto || needs_ixbrowser_webrtc {
         if let Some(proxy_id) = payload
             .get("_meta")
             .and_then(|meta| meta.get("proxy_id"))
@@ -460,9 +467,15 @@ async fn profile_save(
             let entry = proxy::get(proxy_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "selected proxy no longer exists".to_string())?;
-            proxy::ensure_cached_geo(&entry).await.map_err(|e| {
-                format!("Proxy GeoIP auto-detection failed: {e}. Test the proxy, then save the profile again.")
-            })?;
+            if needs_ixbrowser_webrtc {
+                proxy::ensure_ixbrowser_webrtc(&entry).await.map_err(|e| {
+                    format!("Proxy GeoIP/WebRTC preparation failed: {e}. Test the proxy, then save the profile again.")
+                })?;
+            } else {
+                proxy::ensure_cached_geo(&entry).await.map_err(|e| {
+                    format!("Proxy GeoIP auto-detection failed: {e}. Test the proxy, then save the profile again.")
+                })?;
+            }
         }
     }
     // UI saves enrich new profiles; the API persists verbatim.
@@ -562,7 +575,13 @@ async fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Res
         let entry = proxy::get(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "selected proxy no longer exists".to_string())?;
-        if profile::uses_proxy_auto_fields(&p.config) {
+        if profile::normalize_browser_engine(&p.meta.browser_engine)
+            == profile::ENGINE_IXBROWSER_145
+        {
+            proxy::ensure_ixbrowser_webrtc(&entry).await.map_err(|e| {
+                format!("Proxy GeoIP/WebRTC preparation failed: {e}. Test the proxy, then bind it again.")
+            })?;
+        } else if profile::uses_proxy_auto_fields(&p.config) {
             proxy::ensure_cached_geo(&entry).await.map_err(|e| {
                 format!("Proxy GeoIP auto-detection failed: {e}. Test the proxy, then bind it again.")
             })?;
