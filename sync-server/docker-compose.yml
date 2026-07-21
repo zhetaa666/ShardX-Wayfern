@@ -1,6 +1,8 @@
 services:
   sync-server:
-    build: .
+    build:
+      context: .
+      network: host
     container_name: shardx-sync-server
     restart: unless-stopped
     env_file: .env
