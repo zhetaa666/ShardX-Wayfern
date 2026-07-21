@@ -27,6 +27,8 @@ The script installs Docker + Compose, creates `.env`, generates a token, builds 
 - MinIO S3: `http://YOUR_VPS_IP:9000`
 - MinIO console: `http://YOUR_VPS_IP:9001`
 
+The API image build uses the host network. This keeps Debian and npm package downloads working on VPS providers whose Docker bridge rejects outbound repository traffic; runtime containers remain on the Compose network.
+
 ## Manual run
 
 ```bash
