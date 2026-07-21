@@ -1,6 +1,7 @@
 use crate::{settings, store};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -35,6 +36,33 @@ pub struct ProxyEntry {
 }
 
 impl ProxyEntry {
+    fn connection_signature(&self) -> String {
+        let mut hasher = Sha256::new();
+        let scheme = match self.kind {
+            ProxyKind::Socks5 => "socks5",
+            ProxyKind::Http => "http",
+            ProxyKind::Https => "https",
+        };
+        hasher.update(scheme.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.host.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.port.to_be_bytes());
+        hasher.update([0]);
+        hasher.update(self.username.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.password.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.host == other.host
+            && self.port == other.port
+            && self.username == other.username
+            && self.password == other.password
+    }
+
     /// Build `--proxy-server=<scheme>://[user:pass@]host:port` for ShardX.
     pub fn to_proxy_server_arg(&self) -> String {
         let scheme = match self.kind {
@@ -85,24 +113,25 @@ pub fn upsert(mut entry: ProxyEntry) -> Result<ProxyEntry> {
         entry.id = uuid::Uuid::new_v4().to_string();
     }
     let mut s = load()?;
-    if let Some(slot) = s.proxies.iter_mut().find(|p| p.id == entry.id) {
+    let connection_changed = if let Some(slot) = s.proxies.iter_mut().find(|p| p.id == entry.id) {
+        let changed = !slot.same_connection(&entry);
         *slot = entry.clone();
+        changed
     } else {
         s.proxies.push(entry.clone());
-    }
+        true
+    };
     save(&s)?;
+    if connection_changed {
+        clear_cache_key(&entry.id)?;
+    }
     Ok(entry)
 }
 
-/// Upsert that reuses an entry with the same kind/host/port/username.
+/// Upsert that reuses an entry with the same effective connection.
 pub fn upsert_dedup(mut entry: ProxyEntry) -> Result<ProxyEntry> {
     let mut s = load()?;
-    if let Some(existing) = s.proxies.iter().find(|p| {
-        p.kind == entry.kind
-            && p.host == entry.host
-            && p.port == entry.port
-            && p.username == entry.username
-    }) {
+    if let Some(existing) = s.proxies.iter().find(|p| p.same_connection(&entry)) {
         return Ok(existing.clone());
     }
     if entry.id.is_empty() {
@@ -117,11 +146,12 @@ pub fn delete(id: &str) -> Result<()> {
     let mut s = load()?;
     s.proxies.retain(|p| p.id != id);
     save(&s)?;
-    // Also wipe persisted test history.
+    // Also wipe persisted test history and cache identity.
     let mut hs = load_history()?;
     if hs.by_proxy.remove(id).is_some() {
         save_history(&hs)?;
     }
+    clear_cache_key(id)?;
     Ok(())
 }
 
@@ -452,22 +482,74 @@ pub struct GeoInfo {
     pub provider: String,
 }
 
+fn string_value(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|field| field.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn float_value(value: &serde_json::Value, key: &str) -> f64 {
+    value
+        .get(key)
+        .and_then(|field| {
+            field
+                .as_f64()
+                .or_else(|| field.as_str().and_then(|text| text.parse().ok()))
+        })
+        .unwrap_or(0.0)
+}
+
+fn parse_ixbrowser_geo(body: &serde_json::Value, provider: String) -> Result<GeoInfo> {
+    if string_value(body, "status") != "success" {
+        anyhow::bail!("ixbrowser.com: {}", string_value(body, "message"));
+    }
+    let region_name = string_value(body, "regionName");
+    Ok(GeoInfo {
+        ip: string_value(body, "query"),
+        country: string_value(body, "country"),
+        country_code: string_value(body, "countryCode"),
+        region: if region_name.is_empty() {
+            string_value(body, "region")
+        } else {
+            region_name
+        },
+        city: string_value(body, "city"),
+        isp: string_value(body, "isp"),
+        timezone: string_value(body, "timezone"),
+        latitude: float_value(body, "lat"),
+        longitude: float_value(body, "lon"),
+        provider,
+    })
+}
+
 /// Probe IP/country the world sees when traffic exits the proxy.
 pub async fn geo_check(entry: &ProxyEntry, provider_override: Option<String>) -> Result<GeoInfo> {
     geo_check_via(Some(entry), provider_override).await
 }
 
-/// Probe geo through `entry` if Some, else direct; provider default ip-api.com.
+/// Probe geo through `entry` if Some, else direct; provider default ixBrowser.
 pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option<String>) -> Result<GeoInfo> {
-    let provider = provider_override
+    let configured = provider_override
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| settings::load().ok().and_then(|s| s.geo_checker).unwrap_or_else(|| "ip-api.com".into()));
+        .unwrap_or_else(|| {
+            settings::load()
+                .ok()
+                .and_then(|s| s.geo_checker)
+                .unwrap_or_else(|| "ixbrowser.com".into())
+        });
+    let provider = match configured.as_str() {
+        "ixbrowser.com" | "ip-api.com" | "ipapi.co" | "ipwho.is" => configured,
+        _ => "ixbrowser.com".into(),
+    };
 
     let url = match provider.as_str() {
+        "ixbrowser.com" => "https://www.ixbrowser.com/api/ip-api?proxy_mode=2",
         "ip-api.com" => "http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,isp,timezone,lat,lon",
         "ipapi.co" => "https://ipapi.co/json/",
         "ipwho.is" => "https://ipwho.is/",
-        _ => "http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,isp,timezone,lat,lon",
+        _ => "https://www.ixbrowser.com/api/ip-api?proxy_mode=2",
     };
 
     let mut builder = reqwest::Client::builder()
@@ -499,9 +581,12 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
     let f = |v: &serde_json::Value, k: &str| {
-        v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)
+        v.get(k)
+            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0.0)
     };
     let info = match provider.as_str() {
+        "ixbrowser.com" => parse_ixbrowser_geo(&body, provider)?,
         "ip-api.com" => {
             if s(&body, "status") == "fail" {
                 anyhow::bail!("ip-api.com: {}", s(&body, "message"));
@@ -665,7 +750,54 @@ fn save_history(s: &HistoryStore) -> Result<()> {
     Ok(())
 }
 
-/// Persist a test result; same-IP entries collapse, capped at 50 per proxy.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProxyCacheKeys {
+    #[serde(default)]
+    by_proxy: HashMap<String, String>,
+}
+
+fn load_cache_keys() -> Result<ProxyCacheKeys> {
+    let path = store::proxy_cache_keys_path()?;
+    if !path.exists() {
+        return Ok(ProxyCacheKeys::default());
+    }
+    let body = fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&body).unwrap_or_default())
+}
+
+fn save_cache_keys(keys: &ProxyCacheKeys) -> Result<()> {
+    let body = serde_json::to_string_pretty(keys)?;
+    fs::write(store::proxy_cache_keys_path()?, body)?;
+    Ok(())
+}
+
+fn record_cache_key(entry: &ProxyEntry) -> Result<()> {
+    if entry.id.is_empty() {
+        return Ok(());
+    }
+    let mut keys = load_cache_keys()?;
+    keys.by_proxy
+        .insert(entry.id.clone(), entry.connection_signature());
+    save_cache_keys(&keys)
+}
+
+fn clear_cache_key(proxy_id: &str) -> Result<()> {
+    let mut keys = load_cache_keys()?;
+    if keys.by_proxy.remove(proxy_id).is_some() {
+        save_cache_keys(&keys)?;
+    }
+    Ok(())
+}
+
+fn cache_key_matches(entry: &ProxyEntry) -> bool {
+    load_cache_keys()
+        .ok()
+        .and_then(|keys| keys.by_proxy.get(&entry.id).cloned())
+        .map(|signature| signature == entry.connection_signature())
+        .unwrap_or(false)
+}
+
+/// Persist a test result; same-IP consecutive entries collapse, capped at 50 per proxy.
 fn record_test(proxy_id: &str, mut snap: TestSnapshot) -> Result<TestSnapshot> {
     if proxy_id.is_empty() {
         if snap.first_seen.is_empty() {
@@ -676,7 +808,9 @@ fn record_test(proxy_id: &str, mut snap: TestSnapshot) -> Result<TestSnapshot> {
     let mut hs = load_history()?;
     let entries = hs.by_proxy.entry(proxy_id.into()).or_default();
     if let Some(last) = entries.last_mut() {
-        if !snap.ip.is_empty() && last.ip == snap.ip {
+        if !snap.ip.is_empty()
+            && last.ip == snap.ip
+        {
             last.last_seen = snap.last_seen.clone();
             last.tcp_ms = snap.tcp_ms;
             last.udp_ms = snap.udp_ms;
@@ -717,8 +851,15 @@ pub fn snapshot_has_geo(snap: &TestSnapshot) -> bool {
         && snap.longitude != 0.0
 }
 
+pub fn latest_matching_test(entry: &ProxyEntry) -> Option<TestSnapshot> {
+    if !cache_key_matches(entry) {
+        return None;
+    }
+    latest_test(&entry.id).filter(snapshot_has_geo)
+}
+
 pub async fn ensure_cached_geo(entry: &ProxyEntry) -> Result<TestSnapshot> {
-    if let Some(snapshot) = latest_test(&entry.id).filter(snapshot_has_geo) {
+    if let Some(snapshot) = latest_matching_test(entry) {
         return Ok(snapshot);
     }
     let snapshot = full_test(entry).await?;
@@ -788,6 +929,11 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     };
 
     let recorded = record_test(&entry.id, snap)?;
+    if snapshot_has_geo(&recorded) {
+        record_cache_key(entry)?;
+    } else {
+        clear_cache_key(&entry.id)?;
+    }
 
     // Backfill empty country tag on the stored entry.
     if !recorded.country_code.is_empty() {
@@ -801,6 +947,95 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     }
 
     Ok(recorded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> ProxyEntry {
+        ProxyEntry {
+            id: "proxy-1".into(),
+            name: "Detroit".into(),
+            kind: ProxyKind::Socks5,
+            host: "127.0.0.1".into(),
+            port: 1080,
+            username: "user".into(),
+            password: "secret".into(),
+            country: "US".into(),
+            notes: "note".into(),
+        }
+    }
+
+    #[test]
+    fn connection_signature_ignores_display_metadata() {
+        let original = entry();
+        let mut renamed = original.clone();
+        renamed.name = "Other label".into();
+        renamed.notes = "Other note".into();
+        renamed.country = "CA".into();
+
+        assert_eq!(
+            original.connection_signature(),
+            renamed.connection_signature()
+        );
+    }
+
+    #[test]
+    fn connection_signature_changes_with_effective_connection() {
+        let original = entry();
+        let mut changed = original.clone();
+        changed.host = "127.0.0.2".into();
+        assert_ne!(
+            original.connection_signature(),
+            changed.connection_signature()
+        );
+
+        changed = original.clone();
+        changed.password = "new-secret".into();
+        assert_ne!(
+            original.connection_signature(),
+            changed.connection_signature()
+        );
+    }
+
+    #[test]
+    fn ixbrowser_geo_parses_string_coordinates() {
+        let body = serde_json::json!({
+            "status": "success",
+            "country": "ID",
+            "countryCode": "ID",
+            "region": "Jakarta",
+            "regionName": "Jakarta",
+            "city": "Jakarta",
+            "lat": "-6.2146",
+            "lon": "106.8451",
+            "timezone": "Asia/Jakarta",
+            "query": "93.185.162.133"
+        });
+
+        let geo = parse_ixbrowser_geo(&body, "ixbrowser.com".into()).unwrap();
+        assert_eq!(geo.ip, "93.185.162.133");
+        assert_eq!(geo.country_code, "ID");
+        assert_eq!(geo.region, "Jakarta");
+        assert_eq!(geo.city, "Jakarta");
+        assert_eq!(geo.timezone, "Asia/Jakarta");
+        assert_eq!(geo.latitude, -6.2146);
+        assert_eq!(geo.longitude, 106.8451);
+    }
+
+    #[test]
+    fn ixbrowser_geo_accepts_numeric_coordinates() {
+        let body = serde_json::json!({
+            "status": "success",
+            "lat": -6.2146,
+            "lon": 106.8451
+        });
+
+        let geo = parse_ixbrowser_geo(&body, "ixbrowser.com".into()).unwrap();
+        assert_eq!(geo.latitude, -6.2146);
+        assert_eq!(geo.longitude, 106.8451);
+    }
 }
 
 /// Fallback country → IANA timezone for providers that omit timezone.

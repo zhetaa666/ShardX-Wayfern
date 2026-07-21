@@ -2,6 +2,7 @@
 //   $CONFIG/shardx-launcher/
 //     profiles/                   ← fingerprint profile JSON files
 //     proxies.json                ← saved proxy list
+//     proxy-cache-keys.json       ← hashed proxy config for GeoIP cache validity
 //     user-data/<profile-id>/     ← per-profile user-data-dir for ShardX
 //     settings.json               ← global app settings
 
@@ -45,6 +46,10 @@ pub fn user_data_root() -> Result<PathBuf> {
 
 pub fn proxies_path() -> Result<PathBuf> {
     Ok(config_root()?.join("proxies.json"))
+}
+
+pub fn proxy_cache_keys_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("proxy-cache-keys.json"))
 }
 
 pub fn settings_path() -> Result<PathBuf> {

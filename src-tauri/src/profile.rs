@@ -472,7 +472,8 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<Vec<String>> {
 }
 
 /// Existing ShardX profiles keep their original directory. Compatibility
-/// engines live below that directory so Chromium versions never share state.
+/// engines live below it with a profile-specific basename so Chromium versions
+/// never share state and Windows gives each profile a distinct taskbar identity.
 pub fn user_data_dir(id: &str) -> Result<PathBuf> {
     if id.contains(['/', '\\', '.']) {
         anyhow::bail!("invalid profile id");
@@ -482,10 +483,27 @@ pub fn user_data_dir(id: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
+fn ixbrowser_user_data_name(id: &str) -> String {
+    id.to_string()
+}
+
 pub fn engine_user_data_dir(id: &str, engine: &str) -> Result<PathBuf> {
     let root = user_data_dir(id)?;
     let p = if normalize_browser_engine(engine) == ENGINE_IXBROWSER_145 {
-        root.join(ENGINE_IXBROWSER_145)
+        let legacy = root.join(ENGINE_IXBROWSER_145);
+        let isolated = root.join(ixbrowser_user_data_name(id));
+        if legacy.exists() && !isolated.exists() {
+            match std::fs::rename(&legacy, &isolated) {
+                Ok(()) => {}
+                Err(_) if isolated.exists() => return Ok(isolated),
+                Err(error) => {
+                    anyhow::bail!(
+                        "stop every Chromium 145 process, then retry profile data migration for {id}: {error}"
+                    );
+                }
+            }
+        }
+        isolated
     } else {
         root
     };
@@ -496,6 +514,21 @@ pub fn engine_user_data_dir(id: &str, engine: &str) -> Result<PathBuf> {
 pub fn profile_user_data_dir(id: &str) -> Result<PathBuf> {
     let stored = load_raw(id)?;
     engine_user_data_dir(id, &stored.meta.browser_engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ixbrowser_user_data_names_are_profile_specific() {
+        let first = ixbrowser_user_data_name("profile-a");
+        let second = ixbrowser_user_data_name("profile-b");
+
+        assert_ne!(first, second);
+        assert_eq!(first, "profile-a");
+        assert_eq!(second, "profile-b");
+    }
 }
 
 fn chrono_now_iso() -> String {

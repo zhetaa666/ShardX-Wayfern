@@ -251,7 +251,7 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
         let stored = crate::proxy::upsert_dedup(entry)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        // Best-effort full test (UDP + geo); launch re-probes UDP live anyway.
+        // Best-effort full test prepares cached UDP and GeoIP data. Launch never probes.
         let _ = crate::proxy::full_test(&stored).await;
         meta["proxy_id"] = json!(stored.id);
         crate::notify_store_changed("proxies");

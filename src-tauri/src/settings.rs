@@ -14,7 +14,7 @@ pub struct Settings {
     #[serde(default = "default_theme")]
     pub theme: String,
     /// Geo-IP checker provider used by the proxy "Test" button.
-    /// One of "ip-api.com" | "ipapi.co" | "ipwho.is".
+    /// One of "ixbrowser.com" | "ip-api.com" | "ipapi.co" | "ipwho.is".
     #[serde(default)]
     pub geo_checker: Option<String>,
     /// "fingerprint" (use the screen from the bound fingerprint) or
@@ -96,7 +96,7 @@ pub fn load() -> Result<Settings> {
             browser_path: None,
             ixbrowser_145_path: None,
             theme: default_theme(),
-            geo_checker: Some("ip-api.com".into()),
+            geo_checker: Some("ixbrowser.com".into()),
             screen_resolution_mode: Some("fingerprint".into()),
             minimize_to_tray: default_minimize_to_tray(),
             api_enabled: default_api_enabled(),

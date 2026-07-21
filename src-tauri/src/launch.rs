@@ -70,7 +70,7 @@ pub async fn launch_profile(
         .as_ref()
         .map(|p| {
             matches!(p.kind, proxy::ProxyKind::Socks5)
-                && proxy::latest_test(&p.id).and_then(|s| s.udp_ms).is_some()
+                && proxy::latest_matching_test(p).and_then(|s| s.udp_ms).is_some()
         })
         .unwrap_or(false);
 
@@ -79,7 +79,7 @@ pub async fn launch_profile(
     raw.remove("_meta");
     let cached_geo = bound_proxy
         .as_ref()
-        .and_then(|p| proxy::latest_test(&p.id))
+        .and_then(proxy::latest_matching_test)
         .and_then(snapshot_geo);
     let auto_geo = resolve_auto_fields(&mut raw, bound_proxy.as_ref(), cached_geo.as_ref());
     let effective_geo = auto_geo.as_ref().or(cached_geo.as_ref());
@@ -91,10 +91,17 @@ pub async fn launch_profile(
         .to_string();
     let json = serde_json::to_string(&raw).context("serialize profile")?;
     let public_ip = effective_geo.map(|g| g.ip.as_str());
+    let profile_name = stored
+        .config
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("untitled");
 
     let (bin, mut engine_args) = if engine == profile::ENGINE_IXBROWSER_145 {
         let config = crate::ixbrowser::build_launch_config(
             profile_id,
+            profile_name,
             &raw,
             &udd,
             effective_geo,
@@ -182,7 +189,7 @@ pub async fn launch_profile(
         .unwrap_or("auto");
     let latest = bound_proxy
         .as_ref()
-        .and_then(|p| proxy::latest_test(&p.id));
+        .and_then(proxy::latest_matching_test);
     // Public IP for ICE-candidate spoofing: reuse the geo fetched during
     // auto-field resolution when available, else the cached test snapshot.
     // Never a live lookup here — launch already cost one geo round-trip at
