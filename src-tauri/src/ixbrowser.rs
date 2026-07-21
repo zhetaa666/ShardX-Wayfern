@@ -328,6 +328,7 @@ pub fn build_launch_config(
     udd: &Path,
     geo: Option<&proxy::GeoInfo>,
     public_ip: Option<&str>,
+    timezone: &str,
 ) -> Result<LaunchConfig> {
     let binary = resolve_binary()?;
     let nav = object(raw, "navigator");
@@ -351,13 +352,6 @@ pub fn build_launch_config(
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
         .unwrap_or(&languages);
-    let timezone = raw
-        .get("timezone")
-        .and_then(Value::as_str)
-        .filter(|v| *v != "auto")
-        .or_else(|| geo.map(|g| g.timezone.as_str()).filter(|v| !v.is_empty()))
-        .unwrap_or("UTC");
-
     let static_config = json!({
         "MaxTouchPoints": value_u64(nav, "max_touch_points", 0),
         "FoceSafeBrowsing": true,
@@ -412,9 +406,14 @@ pub fn build_launch_config(
     let static_path = config_dir.join("static.config");
     let dynamic_path = config_dir.join("dynamic.config");
     let webgl_path = config_dir.join("webgl.json");
-    std::fs::write(&static_path, encode_json(&static_config)?)?;
-    std::fs::write(&dynamic_path, encode_json(&Value::Object(dynamic))?)?;
-    std::fs::write(&webgl_path, serde_json::to_vec(&webgl_config)?)?;
+    let dynamic = Value::Object(dynamic);
+    write_atomic(&static_path, encode_json(&static_config)?.as_bytes())?;
+    write_atomic(&dynamic_path, encode_json(&dynamic)?.as_bytes())?;
+    write_atomic(&webgl_path, &serde_json::to_vec(&webgl_config)?)?;
+    let decoded_dynamic = decode_json(&std::fs::read_to_string(&dynamic_path)?)?;
+    if decoded_dynamic.get("TimeZone").and_then(Value::as_str) != Some(timezone) {
+        anyhow::bail!("ixBrowser dynamic timezone validation failed");
+    }
 
     let marks = Marks::new(profile_id);
     let extended = json!({
@@ -495,6 +494,28 @@ fn encode_json(value: &Value) -> Result<String> {
         });
     }
     String::from_utf8(translated).context("ixBrowser Base64 output was not UTF-8")
+}
+
+fn decode_json(encoded: &str) -> Result<Value> {
+    let mut translated = Vec::with_capacity(encoded.len());
+    for byte in encoded.trim().bytes() {
+        translated.push(match IXB_ALPHABET.iter().position(|c| *c == byte) {
+            Some(index) => STANDARD_ALPHABET[index],
+            None => byte,
+        });
+    }
+    let bytes = STANDARD.decode(translated)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes)?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(temporary, path)?;
+    Ok(())
 }
 
 fn object<'a>(raw: &'a Map<String, Value>, key: &str) -> Option<&'a Map<String, Value>> {
@@ -588,4 +609,20 @@ fn positive_mark(profile_id: &str, slot: &str) -> i32 {
 
 fn signed_mark(profile_id: &str, slot: &str) -> i32 {
     (hash(profile_id, slot) % 19_999) as i32 - 9_999
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_timezone_round_trips_as_string() {
+        let value = json!({
+            "BlockList": { "Version": "2", "Domains": [] },
+            "TimeZone": "America/Detroit"
+        });
+        let encoded = encode_json(&value).unwrap();
+        let decoded = decode_json(&encoded).unwrap();
+        assert_eq!(decoded.get("TimeZone").and_then(Value::as_str), Some("America/Detroit"));
+    }
 }

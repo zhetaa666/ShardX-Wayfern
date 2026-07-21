@@ -64,7 +64,9 @@ libc = "0.2"
 aes-gcm = "0.10"
 getrandom = "0.2"
 windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",            # HLOCAL + LocalFree live here in 0.59
-    "Win32_Security_Cryptography", # CryptProtectData / CryptUnprotectData
+    "Win32_Foundation",             # HLOCAL + LocalFree live here in 0.59
+    "Win32_Security_Cryptography",  # CryptProtectData / CryptUnprotectData
+    "Win32_System_JobObjects",      # Kill Chromium child processes with the root
+    "Win32_System_Threading",       # OpenProcess / process handles for job ownership
 ] }
 

@@ -43,9 +43,16 @@ pub async fn launch_profile(
     enable_cdp: bool,
     headless: bool,
 ) -> Result<LaunchOutcome> {
+    if Tracker::shared().is_running(profile_id) {
+        anyhow::bail!("profile is already running");
+    }
     let stored = profile::load_raw(profile_id)?;
     let engine = profile::normalize_browser_engine(&stored.meta.browser_engine);
     let udd = profile::engine_user_data_dir(profile_id, engine)?;
+    process::kill_stale_user_data_processes(&udd);
+    for marker in ["DevToolsActivePort", "SingletonCookie", "SingletonLock", "SingletonSocket"] {
+        let _ = std::fs::remove_file(udd.join(marker));
+    }
 
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
     let bound_proxy: Option<proxy::ProxyEntry> = stored
@@ -76,6 +83,12 @@ pub async fn launch_profile(
         .and_then(snapshot_geo);
     let auto_geo = resolve_auto_fields(&mut raw, bound_proxy.as_ref(), cached_geo.as_ref());
     let effective_geo = auto_geo.as_ref().or(cached_geo.as_ref());
+    let resolved_timezone = raw
+        .get("timezone")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| *v != "auto" && !v.is_empty())
+        .unwrap_or("UTC")
+        .to_string();
     let json = serde_json::to_string(&raw).context("serialize profile")?;
     let public_ip = effective_geo.map(|g| g.ip.as_str());
 
@@ -86,6 +99,7 @@ pub async fn launch_profile(
             &udd,
             effective_geo,
             public_ip,
+            &resolved_timezone,
         )?;
         (config.binary, config.args)
     } else {
@@ -141,6 +155,15 @@ pub async fn launch_profile(
     }
 
     if let Some(p) = bound_proxy.as_ref() {
+        let scheme = match p.kind {
+            proxy::ProxyKind::Socks5 => "socks5",
+            proxy::ProxyKind::Http => "http",
+            proxy::ProxyKind::Https => "https",
+        };
+        eprintln!(
+            "[launcher] profile={profile_id} proxy_id={} proxy={scheme}://{}:{} timezone={resolved_timezone}",
+            p.id, p.host, p.port
+        );
         cmd.arg(format!("--proxy-server={}", p.to_proxy_server_arg()));
 
         // QUIC always OFF behind a proxy.  Chromium routes HTTP/3 through the
