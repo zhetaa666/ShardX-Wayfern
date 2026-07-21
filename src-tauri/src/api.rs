@@ -240,7 +240,11 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
         let entry = crate::proxy::get(pid)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "selected proxy no longer exists"))?;
-        if crate::profile::uses_proxy_auto_fields(&cfg) {
+        if engine == crate::profile::ENGINE_IXBROWSER_145 {
+            crate::proxy::ensure_ixbrowser_webrtc(&entry)
+                .await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
+        } else if crate::profile::uses_proxy_auto_fields(&cfg) {
             crate::proxy::ensure_cached_geo(&entry)
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP auto-detection failed: {e}")))?;
@@ -251,8 +255,14 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
         let stored = crate::proxy::upsert_dedup(entry)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        // Best-effort full test prepares cached UDP and GeoIP data. Launch never probes.
-        let _ = crate::proxy::full_test(&stored).await;
+        crate::proxy::full_test(&stored)
+            .await
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy test failed: {e}")))?;
+        if engine == crate::profile::ENGINE_IXBROWSER_145 {
+            crate::proxy::ensure_ixbrowser_webrtc(&stored)
+                .await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
+        }
         meta["proxy_id"] = json!(stored.id);
         crate::notify_store_changed("proxies");
     }
@@ -298,7 +308,12 @@ async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
     if let Some(n) = body.name.as_ref() {
         cfg.insert("name".into(), json!(n));
     }
-    let mut meta = json!({ "id": "", "folder": body.folder.unwrap_or_default(), "temporary": true });
+    let mut meta = json!({
+        "id": "",
+        "folder": body.folder.unwrap_or_default(),
+        "browser_engine": crate::profile::ENGINE_SHARDX,
+        "temporary": true
+    });
     if let Some(pstr) = body.proxy.as_ref() {
         let entry = crate::proxy::parse_single(pstr)
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
@@ -366,7 +381,13 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
             let entry = crate::proxy::get(pid)
                 .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
                 .ok_or_else(|| err(StatusCode::BAD_REQUEST, "selected proxy no longer exists"))?;
-            if crate::profile::uses_proxy_auto_fields(&stored.config) {
+            if crate::profile::normalize_browser_engine(&stored.meta.browser_engine)
+                == crate::profile::ENGINE_IXBROWSER_145
+            {
+                crate::proxy::ensure_ixbrowser_webrtc(&entry)
+                    .await
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
+            } else if crate::profile::uses_proxy_auto_fields(&stored.config) {
                 crate::proxy::ensure_cached_geo(&entry)
                     .await
                     .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP auto-detection failed: {e}")))?;
@@ -379,7 +400,16 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
         let s = crate::proxy::upsert_dedup(entry)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let _ = crate::proxy::full_test(&s).await;
+        crate::proxy::full_test(&s)
+            .await
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy test failed: {e}")))?;
+        if crate::profile::normalize_browser_engine(&stored.meta.browser_engine)
+            == crate::profile::ENGINE_IXBROWSER_145
+        {
+            crate::proxy::ensure_ixbrowser_webrtc(&s)
+                .await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
+        }
         stored.meta.proxy_id = Some(s.id);
         stored.meta.inline_proxy = None;
         crate::notify_store_changed("proxies");

@@ -328,7 +328,8 @@ pub fn build_launch_config(
     raw: &Map<String, Value>,
     udd: &Path,
     geo: Option<&proxy::GeoInfo>,
-    public_ip: Option<&str>,
+    host_public_ips: &[String],
+    webrtc_public_ip: Option<&str>,
     timezone: &str,
 ) -> Result<LaunchConfig> {
     let binary = resolve_binary()?;
@@ -376,25 +377,7 @@ pub fn build_launch_config(
         "JsHeapSizeLimit": raw.get("memory").and_then(|v| v.get("heap_size_limit")).and_then(Value::as_u64).unwrap_or(4_294_967_296).to_string()
     });
 
-    let mut dynamic = Map::new();
-    dynamic.insert(
-        "BlockList".into(),
-        json!({ "Version": "2", "Domains": [] }),
-    );
-    dynamic.insert("TimeZone".into(), json!(timezone));
-    if let Some(g) = geo {
-        if g.latitude != 0.0 && g.longitude != 0.0 {
-            dynamic.insert(
-                "Geoposition".into(),
-                Value::String(format!("{},{},50", g.latitude, g.longitude)),
-            );
-        }
-    }
-    if let Some(ip) = public_ip.filter(|v| !v.is_empty()) {
-        dynamic.insert("PublicIP".into(), Value::String(ip.into()));
-        dynamic.insert("WebRTCLocalAddress".into(), Value::String(ip.into()));
-        dynamic.insert("WebRTCAddress".into(), Value::String(ip.into()));
-    }
+    let dynamic = build_dynamic_config(geo, host_public_ips, webrtc_public_ip, timezone)?;
 
     let webgl_config = json!({
         "UNMASKED_VENDOR_WEBGL": webgl.and_then(|v| v.get("vendor")).and_then(Value::as_str).unwrap_or("Google Inc."),
@@ -407,14 +390,16 @@ pub fn build_launch_config(
     let static_path = config_dir.join("static.config");
     let dynamic_path = config_dir.join("dynamic.config");
     let webgl_path = config_dir.join("webgl.json");
-    let dynamic = Value::Object(dynamic);
     write_atomic(&static_path, encode_json(&static_config)?.as_bytes())?;
     write_atomic(&dynamic_path, encode_json(&dynamic)?.as_bytes())?;
     write_atomic(&webgl_path, &serde_json::to_vec(&webgl_config)?)?;
     let decoded_dynamic = decode_json(&std::fs::read_to_string(&dynamic_path)?)?;
-    if decoded_dynamic.get("TimeZone").and_then(Value::as_str) != Some(timezone) {
-        anyhow::bail!("ixBrowser dynamic timezone validation failed");
-    }
+    validate_dynamic_config(
+        &decoded_dynamic,
+        host_public_ips,
+        webrtc_public_ip,
+        timezone,
+    )?;
 
     let marks = Marks::new(profile_id);
     let extended = json!({
@@ -482,6 +467,72 @@ pub fn build_launch_config(
     }
 
     Ok(LaunchConfig { binary, args })
+}
+
+fn build_dynamic_config(
+    geo: Option<&proxy::GeoInfo>,
+    host_public_ips: &[String],
+    webrtc_public_ip: Option<&str>,
+    timezone: &str,
+) -> Result<Value> {
+    let mut dynamic = Map::new();
+    dynamic.insert(
+        "BlockList".into(),
+        json!({ "Version": "2", "Domains": [] }),
+    );
+    dynamic.insert("TimeZone".into(), json!(timezone));
+    if let Some(g) = geo {
+        if g.latitude != 0.0 && g.longitude != 0.0 {
+            dynamic.insert(
+                "Geoposition".into(),
+                Value::String(format!("{},{},50", g.latitude, g.longitude)),
+            );
+        }
+    }
+    if let Some(replacement) = webrtc_public_ip.filter(|value| !value.is_empty()) {
+        if host_public_ips.is_empty() {
+            anyhow::bail!(
+                "ixBrowser WebRTC replacement requires the host public IP; test or rebind the proxy first"
+            );
+        }
+        dynamic.insert(
+            "PublicIP".into(),
+            Value::String(host_public_ips.join(",")),
+        );
+        dynamic.insert(
+            "WebRTCLocalAddress".into(),
+            Value::String(replacement.into()),
+        );
+        dynamic.insert(
+            "WebRTCAddress".into(),
+            Value::String(replacement.into()),
+        );
+    }
+    Ok(Value::Object(dynamic))
+}
+
+fn validate_dynamic_config(
+    dynamic: &Value,
+    host_public_ips: &[String],
+    webrtc_public_ip: Option<&str>,
+    timezone: &str,
+) -> Result<()> {
+    if dynamic.get("TimeZone").and_then(Value::as_str) != Some(timezone) {
+        anyhow::bail!("ixBrowser dynamic timezone validation failed");
+    }
+    if let Some(replacement) = webrtc_public_ip.filter(|value| !value.is_empty()) {
+        let expected_sources = host_public_ips.join(",");
+        let public_ip = dynamic.get("PublicIP").and_then(Value::as_str);
+        let local = dynamic.get("WebRTCLocalAddress").and_then(Value::as_str);
+        let public = dynamic.get("WebRTCAddress").and_then(Value::as_str);
+        if public_ip != Some(expected_sources.as_str())
+            || local != Some(replacement)
+            || public != Some(replacement)
+        {
+            anyhow::bail!("ixBrowser dynamic WebRTC replacement validation failed");
+        }
+    }
+    Ok(())
 }
 
 fn encode_json(value: &Value) -> Result<String> {
@@ -625,5 +676,53 @@ mod tests {
         let encoded = encode_json(&value).unwrap();
         let decoded = decode_json(&encoded).unwrap();
         assert_eq!(decoded.get("TimeZone").and_then(Value::as_str), Some("America/Detroit"));
+    }
+
+    #[test]
+    fn dynamic_webrtc_maps_host_sources_to_proxy_replacement() {
+        let sources = vec![
+            "168.144.42.200".to_string(),
+            "2001:db8::25".to_string(),
+        ];
+        let dynamic = build_dynamic_config(
+            None,
+            &sources,
+            Some("212.102.46.41"),
+            "America/Los_Angeles",
+        )
+        .unwrap();
+
+        assert_eq!(
+            dynamic.get("PublicIP").and_then(Value::as_str),
+            Some("168.144.42.200,2001:db8::25")
+        );
+        assert_eq!(
+            dynamic.get("WebRTCAddress").and_then(Value::as_str),
+            Some("212.102.46.41")
+        );
+        assert_eq!(
+            dynamic.get("WebRTCLocalAddress").and_then(Value::as_str),
+            Some("212.102.46.41")
+        );
+        validate_dynamic_config(
+            &dynamic,
+            &sources,
+            Some("212.102.46.41"),
+            "America/Los_Angeles",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dynamic_webrtc_rejects_missing_host_source() {
+        let error = build_dynamic_config(
+            None,
+            &[],
+            Some("212.102.46.41"),
+            "America/Los_Angeles",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("host public IP"));
     }
 }
