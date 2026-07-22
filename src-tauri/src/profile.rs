@@ -202,6 +202,10 @@ pub fn purge_temporary() -> Result<usize> {
     Ok(n)
 }
 
+pub fn exists(id: &str) -> Result<bool> {
+    Ok(path_for(id)?.is_file())
+}
+
 pub fn load_raw(id: &str) -> Result<StoredProfile> {
     let path = path_for(id)?;
     let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -265,6 +269,60 @@ fn clear_noise_seeds(config: &mut serde_json::Map<String, serde_json::Value>) {
     }
 }
 
+pub(crate) fn write_atomic(path: &std::path::Path, body: &[u8]) -> Result<()> {
+    let temp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
+    fs::write(&temp, body)?;
+    #[cfg(windows)]
+    if path.exists() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let replacement: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let moved = unsafe {
+            MoveFileExW(
+                replacement.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    if path.exists() {
+        fs::rename(&temp, path)?;
+        return Ok(());
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+pub fn save_synced(stored: &mut StoredProfile) -> Result<()> {
+    if stored.meta.id.is_empty() {
+        anyhow::bail!("synced profile id is empty");
+    }
+    if let Ok(existing) = load_raw(&stored.meta.id) {
+        stored.meta.last_launched_at = existing.meta.last_launched_at;
+        stored.meta.total_runtime_ms = existing.meta.total_runtime_ms;
+    }
+    if stored.meta.created_at.is_none() {
+        stored.meta.created_at = Some(chrono_now_iso());
+    }
+    fill_noise_seeds(&mut stored.config, &stored.meta.id);
+    let path = path_for(&stored.meta.id)?;
+    write_atomic(&path, &serde_json::to_vec_pretty(stored)?)
+}
+
 pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     let is_new = stored.meta.id.is_empty();
     if is_new {
@@ -305,9 +363,8 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     // unique-but-stable fingerprint instead of sharing the UI's placeholder.
     fill_noise_seeds(&mut stored.config, &stored.meta.id);
     let path = path_for(&stored.meta.id)?;
-    let body = serde_json::to_string_pretty(stored)?;
-    fs::write(path, body)?;
-    Ok(())
+    let body = serde_json::to_vec_pretty(stored)?;
+    write_atomic(&path, &body)
 }
 
 pub fn delete(id: &str) -> Result<()> {

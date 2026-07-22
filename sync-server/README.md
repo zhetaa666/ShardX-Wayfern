@@ -4,7 +4,7 @@ Self-hosted sync backend for ShardX Launcher.
 
 ## What it syncs
 
-The launcher v0.2.7 client can push/pull:
+The launcher client can push/pull:
 
 - profiles
 - proxies
@@ -71,28 +71,26 @@ Endpoints:
 - `POST /storage/:profileId/:revision`
 - `GET /storage/:profileId/latest`
 
+Protocol 2 uses server-owned revisions and compare-and-swap writes. Clients send their last accepted server revision as `revision`; new items use `0`. The server returns accepted item envelopes with the new revision and returns stale or lease-locked writes in `conflicts` without overwriting current data.
+
 Item envelope:
 
 ```json
 {
-  "kind": "profile|proxies|fingerprint|cookies",
+  "kind": "profile|proxy|fingerprint|cookies|storage_bundle",
   "id": "string",
-  "updated_at": "@unix_seconds",
+  "updated_at": "@server_unix_seconds",
   "deleted_at": null,
   "device_id": "uuid",
-  "revision": 0,
+  "revision": 12,
+  "checksum": "sha256",
   "payload": {}
 }
 ```
 
 ## Important workflow
 
-For reliable premium-style session sync:
-
-1. Stop profile on Device A.
-2. Sync now uploads latest cookies/profile config.
-3. Device B Sync now pulls latest state.
-4. Launch profile on Device B.
+The launcher acquires a per-profile lease before reconciling and launching. On browser close it waits for Chromium storage to flush, uploads changed state while the lease remains held, and releases the lease afterward. Installer and portable packages use the same dynamic lease behavior.
 
 Profile must be stopped before cookie/storage import/export. Running Chromium may not flush SQLite/LevelDB yet.
 

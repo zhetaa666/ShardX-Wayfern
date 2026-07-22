@@ -39,6 +39,40 @@ pub fn resolve_binary() -> Result<PathBuf> {
     anyhow::bail!("ShardX browser not installed yet — open Settings to download, or configure Browser path manually")
 }
 
+fn remove_session_artifacts(user_data_dir: &Path) {
+    let default = user_data_dir.join("Default");
+    let sessions = default.join("Sessions");
+    if sessions.exists() {
+        let _ = std::fs::remove_dir_all(sessions);
+    }
+    for name in ["Current Session", "Current Tabs", "Last Session", "Last Tabs"] {
+        let _ = std::fs::remove_file(default.join(name));
+    }
+}
+
+fn configure_fresh_startup(user_data_dir: &Path) {
+    remove_session_artifacts(user_data_dir);
+    let preferences = user_data_dir.join("Default").join("Preferences");
+    let Ok(body) = std::fs::read_to_string(&preferences) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return;
+    };
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let session = root
+        .entry("session".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(session) = session.as_object_mut() {
+        session.insert("restore_on_startup".into(), serde_json::json!(5));
+    }
+    if let Ok(updated) = serde_json::to_vec(&value) {
+        let _ = profile::write_atomic(&preferences, &updated);
+    }
+}
+
 pub async fn launch_profile(
     profile_id: &str,
     enable_cdp: bool,
@@ -51,6 +85,7 @@ pub async fn launch_profile(
     let engine = profile::normalize_browser_engine(&stored.meta.browser_engine);
     let udd = profile::engine_user_data_dir(profile_id, engine)?;
     process::kill_stale_user_data_processes(&udd);
+    configure_fresh_startup(&udd);
     for marker in ["DevToolsActivePort", "SingletonCookie", "SingletonLock", "SingletonSocket"] {
         let _ = std::fs::remove_file(udd.join(marker));
     }
@@ -172,9 +207,9 @@ pub async fn launch_profile(
         cmd.arg("--disable-renderer-backgrounding");
     }
 
-    // Interactive launches: restore previous session, suppress crash bubble.
+    // Interactive launches start on Chromium's default tab without reopening
+    // prior windows; cookies and site storage remain in the user-data-dir.
     if !headless && !enable_cdp {
-        cmd.arg("--restore-last-session");
         cmd.arg("--hide-crash-restore-bubble");
     }
 

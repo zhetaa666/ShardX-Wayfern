@@ -106,13 +106,17 @@ fn emit_profile_sync_warning(profile_id: &str, error: &anyhow::Error) {
     eprintln!("[sync] profile {profile_id} cloud save failed: {error}");
     if let Some(w) = main_window() {
         use tauri::Emitter;
+        let detail = error.to_string();
+        let message = if detail.contains("backed up") {
+            format!("Cloud profile changed elsewhere. The local version was backed up and the server version was restored: {detail}")
+        } else {
+            format!("Profile saved locally, but cloud sync failed: {detail}. It will retry on the next sync.")
+        };
         let _ = w.emit(
             "profile-sync-warning",
             serde_json::json!({
                 "profile_id": profile_id,
-                "message": format!(
-                    "Profile saved locally, but cloud sync failed: {error}. It will retry before the next launch."
-                ),
+                "message": message,
             }),
         );
     }
@@ -1000,61 +1004,32 @@ fn proxy_bulk_save(entries: Vec<proxy::ProxyEntry>) -> Result<usize, String> {
 async fn launch(profile_id: String) -> Result<u32, String> {
     ensure_profile_not_syncing(&profile_id)?;
 
-    // Premium pull-before-Start: download the newest profile bundle (config +
-    // cookies + storage) from the server, reconstruct it locally, then spawn.
-    // Robust offline: a failure only warns — we still launch from local data.
     let cfg = settings::load().ok();
     let sync_on = cfg.as_ref().map(|s| s.sync_enabled).unwrap_or(false);
-    if sync_on && cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
-        match sync::pull_profile(&profile_id).await {
-            Ok(report) => {
-                if report.applied > 0 {
-                    notify_store_changed("profiles");
-                }
-            }
-            Err(e) => {
-                // Warn-then-launch: surface a toast but continue with local data.
-                if let Some(w) = main_window() {
-                    use tauri::Emitter;
-                    let _ = w.emit(
-                        "launch-warning",
-                        serde_json::json!({
-                            "profile_id": profile_id,
-                            "message": format!("Could not pull latest: {e}. Launching local copy."),
-                        }),
-                    );
-                }
-            }
-        }
-    }
-
-    // Device lease: block if the profile is open on another live device, so we
-    // don't overwrite its cookies.  Sync off → skip.  Server unreachable or
-    // missing the /lease routes (old sync-server build) → warn but launch,
-    // so an outage never bricks the Start button.
+    let mut lease_held = false;
     if sync_on {
         match sync::acquire_lease(&profile_id).await {
             Ok(state) if !state.held_by_me && !state.free => {
                 let who = state
                     .holder_label
-                    .filter(|l| !l.is_empty())
+                    .filter(|label| !label.is_empty())
                     .unwrap_or_else(|| state.holder_device.clone());
                 return Err(format!("profile is open on another device ({who})"));
             }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("[launcher] lease acquire failed for {profile_id}: {e}");
-                if let Some(w) = main_window() {
+            Ok(_) => lease_held = true,
+            Err(error) => {
+                if !profile::exists(&profile_id).map_err(|e| e.to_string())? {
+                    return Err(format!(
+                        "profile is missing locally and the sync lease could not be acquired: {error}"
+                    ));
+                }
+                if let Some(window) = main_window() {
                     use tauri::Emitter;
-                    let _ = w.emit(
+                    let _ = window.emit(
                         "launch-warning",
                         serde_json::json!({
                             "profile_id": profile_id,
-                            "message": format!(
-                                "Device lease unavailable ({e}) — launching anyway. \
-                                 If this persists, update the sync server (it may \
-                                 predate the /lease API)."
-                            ),
+                            "message": format!("Sync server unavailable ({error}). Launching the valid local copy."),
                         }),
                     );
                 }
@@ -1062,11 +1037,42 @@ async fn launch(profile_id: String) -> Result<u32, String> {
         }
     }
 
-    // UI launches: no CDP, headed.
-    launch::launch_profile(&profile_id, false, false)
-        .await
-        .map(|o| o.pid)
-        .map_err(|e| e.to_string())
+    if sync_on && lease_held {
+        if cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
+            match sync::pull_profile(&profile_id).await {
+                Ok(report) => {
+                    if report.applied > 0 {
+                        notify_store_changed("profiles");
+                    }
+                }
+                Err(error) => {
+                    if !profile::exists(&profile_id).map_err(|e| e.to_string())? {
+                        sync::release_lease(&profile_id).await;
+                        return Err(format!("could not recover the missing profile from the sync server: {error}"));
+                    }
+                    if let Some(window) = main_window() {
+                        use tauri::Emitter;
+                        let _ = window.emit(
+                            "launch-warning",
+                            serde_json::json!({
+                                "profile_id": profile_id,
+                                "message": format!("Could not pull latest: {error}. Launching the valid local copy."),
+                            }),
+                        );
+                    }
+                }
+            }
+        } else if !profile::exists(&profile_id).map_err(|e| e.to_string())? {
+            sync::release_lease(&profile_id).await;
+            return Err("profile is missing locally; enable Pull latest on Start to recover it".into());
+        }
+    }
+
+    let result = launch::launch_profile(&profile_id, false, false).await;
+    if result.is_err() && lease_held {
+        sync::release_lease(&profile_id).await;
+    }
+    result.map(|outcome| outcome.pid).map_err(|error| error.to_string())
 }
 
 /// Read the current lease holder for a profile (UI "In use elsewhere" badge).

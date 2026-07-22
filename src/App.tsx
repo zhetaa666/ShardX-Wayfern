@@ -313,6 +313,8 @@ type SyncReport = {
   pushed: number;
   pulled: number;
   skipped: number;
+  conflicts: number;
+  recovered: number;
   cursor?: string | null;
 };
 type SyncRuntimeStatus = {
@@ -5186,7 +5188,12 @@ function SettingsView() {
       await invoke("settings_save", { value: s });
       const r = await invoke<SyncReport>("sync_now");
       refreshSync();
-      toast.ok(`Sync: pushed ${r.pushed}, pulled ${r.pulled}, skipped ${r.skipped}`);
+      const extra = [
+        r.recovered > 0 ? `recovered ${r.recovered}` : "",
+        r.conflicts > 0 ? `backed up ${r.conflicts} conflict${r.conflicts === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(", ");
+      const message = `Sync: pushed ${r.pushed}, pulled ${r.pulled}, skipped ${r.skipped}${extra ? `, ${extra}` : ""}`;
+      if (r.conflicts > 0) toast.info(message); else toast.ok(message);
     } catch (e) { toast.err(String(e)); }
   };
   return (

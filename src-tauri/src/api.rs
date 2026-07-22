@@ -491,16 +491,57 @@ async fn start_profile(Path(id): Path<String>, body: Option<Json<StartReq>>) -> 
     let cfg = crate::settings::load().ok();
     let sync_on = cfg.as_ref().map(|s| s.sync_enabled).unwrap_or(false);
     let temporary = crate::profile::load_raw(&id)
-        .map(|p| p.meta.temporary)
+        .map(|profile| profile.meta.temporary)
         .unwrap_or(false);
-    if !temporary && sync_on && cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
-        if let Err(e) = crate::sync::pull_profile(&id).await {
-            eprintln!("[sync] API pre-launch sync failed for {id}: {e}");
+    let mut lease_held = false;
+    if !temporary && sync_on {
+        match crate::sync::acquire_lease(&id).await {
+            Ok(state) if !state.held_by_me && !state.free => {
+                let holder = state
+                    .holder_label
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(state.holder_device);
+                return Err(err(StatusCode::CONFLICT, format!("profile is open on another device ({holder})")));
+            }
+            Ok(_) => lease_held = true,
+            Err(error) if !crate::profile::exists(&id).unwrap_or(false) => {
+                return Err(err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("profile is missing locally and the sync lease could not be acquired: {error}"),
+                ));
+            }
+            Err(error) => eprintln!("[sync] API lease unavailable for {id}: {error}"),
         }
     }
-    let outcome = crate::launch::launch_profile(&id, true, headless)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !temporary && sync_on && lease_held {
+        if cfg.as_ref().map(|s| s.sync_pull_on_start).unwrap_or(true) {
+            if let Err(error) = crate::sync::pull_profile(&id).await {
+                if !crate::profile::exists(&id).unwrap_or(false) {
+                    crate::sync::release_lease(&id).await;
+                    return Err(err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("could not recover the missing profile from the sync server: {error}"),
+                    ));
+                }
+                eprintln!("[sync] API pre-launch sync failed for {id}: {error}");
+            }
+        } else if !crate::profile::exists(&id).unwrap_or(false) {
+            crate::sync::release_lease(&id).await;
+            return Err(err(
+                StatusCode::NOT_FOUND,
+                "profile is missing locally; enable Pull latest on Start to recover it",
+            ));
+        }
+    }
+    let outcome = match crate::launch::launch_profile(&id, true, headless).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if lease_held {
+                crate::sync::release_lease(&id).await;
+            }
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()));
+        }
+    };
     let engine = crate::profile::load_raw(&id)
         .map(|p| crate::profile::normalize_browser_engine(&p.meta.browser_engine).to_string())
         .unwrap_or_else(|_| crate::profile::ENGINE_SHARDX.into());
