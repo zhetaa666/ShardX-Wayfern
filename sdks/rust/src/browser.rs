@@ -201,7 +201,6 @@ impl Browser {
             argv.push("--disable-features=WebGPU".into());
         }
         if !opts.headless && !opts.cdp {
-            argv.push("--restore-last-session".into());
             argv.push("--hide-crash-restore-bubble".into());
         }
         if mode == ScreenStrategy::UseHost {

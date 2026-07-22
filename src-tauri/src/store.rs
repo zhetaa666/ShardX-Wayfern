@@ -4,6 +4,8 @@
 //     proxies.json                ← saved proxy list
 //     proxy-cache-keys.json       ← hashed proxy config for GeoIP cache validity
 //     host-public-ips.json        ← device-local source IPs for ixBrowser WebRTC replacement
+//     sync-state.json             ← device-local server revisions and checksums
+//     sync-conflicts/             ← local copies preserved after stale writes
 //     user-data/<profile-id>/     ← per-profile user-data-dir for ShardX
 //     settings.json               ← global app settings
 
@@ -55,6 +57,16 @@ pub fn proxy_cache_keys_path() -> Result<PathBuf> {
 
 pub fn host_public_ips_path() -> Result<PathBuf> {
     Ok(config_root()?.join("host-public-ips.json"))
+}
+
+pub fn sync_state_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("sync-state.json"))
+}
+
+pub fn sync_conflicts_dir() -> Result<PathBuf> {
+    let p = config_root()?.join("sync-conflicts");
+    std::fs::create_dir_all(&p)?;
+    Ok(p)
 }
 
 pub fn settings_path() -> Result<PathBuf> {

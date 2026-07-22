@@ -225,9 +225,8 @@ impl Tracker {
                 }
                 let sync_profile_id = profile_id.clone();
                 tokio::spawn(async move {
-                    // Release our lease first so another device can Start this
-                    // profile immediately, then push the closed session's data.
-                    crate::sync::release_lease(&sync_profile_id).await;
+                    // Keep the lease until Chromium has flushed and the closed
+                    // profile state has been reconciled; sync releases it last.
                     crate::sync::sync_after_profile_close(sync_profile_id).await;
                 });
             }

@@ -66,6 +66,8 @@ jobs:
           cache: npm
       - name: Validate JSON configs
         run: node -e "for (const f of ['package.json','src-tauri/tauri.conf.json']) JSON.parse(require('fs').readFileSync(f, 'utf8'))"
+      - name: Validate sync server syntax
+        run: node --check sync-server/src/server.js
       - name: npm ci
         run: npm ci
       - name: Vite build (typecheck + bundle)

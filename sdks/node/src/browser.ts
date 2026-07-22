@@ -150,7 +150,7 @@ export class Browser {
     ];
     if (!profile.hasWebGPU) argv.push("--disable-features=WebGPU");
     if (!opts.headless && !opts.cdp) {
-      argv.push("--restore-last-session", "--hide-crash-restore-bubble");
+      argv.push("--hide-crash-restore-bubble");
     }
     // Engine-side real-screen switch only fires on use_host (where the SDK
     // already rewrote screen.* — keep them in sync with the launcher).

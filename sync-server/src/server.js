@@ -15,6 +15,8 @@ const DB_PATH = env('DB_PATH', path.join(DATA_DIR, 'sync.sqlite'));
 const SYNC_TOKEN = env('SYNC_TOKEN');
 const WORKSPACE_ID = env('WORKSPACE_ID', 'default');
 const MAX_BODY = Number(env('MAX_BODY_BYTES', String(50 * 1024 * 1024)));
+const SYNC_PROTOCOL = 2;
+const PROFILE_KINDS = new Set(['profile', 'cookies', 'storage_bundle']);
 
 if (!SYNC_TOKEN || SYNC_TOKEN.length < 24) {
   console.error('SYNC_TOKEN must be set and at least 24 chars');
@@ -60,23 +62,32 @@ CREATE TABLE IF NOT EXISTS leases (
   expires_at INTEGER NOT NULL,
   PRIMARY KEY (workspace_id, profile_id)
 );
+UPDATE sync_items SET revision = 1 WHERE revision < 1;
 `);
 
-const upsertItem = db.prepare(`
-INSERT INTO sync_items(workspace_id, kind, id, updated_at, deleted_at, device_id, revision, payload, checksum)
-VALUES(@workspace_id, @kind, @id, @updated_at, @deleted_at, @device_id, @revision, @payload, @checksum)
-ON CONFLICT(workspace_id, kind, id) DO UPDATE SET
-  updated_at=excluded.updated_at,
-  deleted_at=excluded.deleted_at,
-  device_id=excluded.device_id,
-  revision=CASE WHEN excluded.revision > sync_items.revision THEN excluded.revision ELSE sync_items.revision + 1 END,
-  payload=excluded.payload,
-  checksum=excluded.checksum,
+const insertItem = db.prepare(`
+INSERT INTO sync_items(
+  workspace_id, kind, id, updated_at, deleted_at, device_id,
+  revision, payload, checksum
+)
+VALUES(
+  @workspace_id, @kind, @id, @updated_at, @deleted_at, @device_id,
+  1, @payload, @checksum
+)
+`);
+const updateItem = db.prepare(`
+UPDATE sync_items SET
+  updated_at=@updated_at,
+  deleted_at=@deleted_at,
+  device_id=@device_id,
+  revision=revision + 1,
+  payload=@payload,
+  checksum=@checksum,
   server_seq=(SELECT COALESCE(MAX(server_seq), 0) + 1 FROM sync_items)
-WHERE excluded.updated_at >= sync_items.updated_at
+WHERE workspace_id=@workspace_id AND kind=@kind AND id=@id AND revision=@revision
 `);
 const changesStmt = db.prepare(`
-SELECT kind,id,updated_at,deleted_at,device_id,revision,payload,server_seq
+SELECT kind,id,updated_at,deleted_at,device_id,revision,payload,server_seq,checksum
 FROM sync_items
 WHERE workspace_id = ? AND server_seq > ?
 ORDER BY server_seq ASC
@@ -123,6 +134,20 @@ function checksum(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalize(value[key])]),
+    );
+  }
+  return value;
+}
+
+function itemChecksum(payload, deleted) {
+  return checksum(JSON.stringify({ deleted, payload: canonicalize(payload) }));
+}
+
 function cursorToSeq(cursor) {
   if (!cursor) return 0;
   const n = Number(String(cursor).replace(/^seq:/, ''));
@@ -132,7 +157,9 @@ function cursorToSeq(cursor) {
 function auth(req, reply, done) {
   const header = req.headers.authorization || '';
   const token = header.replace(/^bearer\s+/i, '').trim();
-  if (!crypto.timingSafeEqual(Buffer.from(token.padEnd(SYNC_TOKEN.length)), Buffer.from(SYNC_TOKEN.padEnd(token.length)))) {
+  const supplied = Buffer.from(token);
+  const expected = Buffer.from(SYNC_TOKEN);
+  if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) {
     reply.code(401).send({ error: 'unauthorized' });
     return;
   }
@@ -141,20 +168,58 @@ function auth(req, reply, done) {
 
 function normalizeItem(raw) {
   if (!raw || typeof raw !== 'object') throw new Error('item must be object');
-  for (const key of ['kind', 'id', 'updated_at', 'device_id', 'payload']) {
+  for (const key of ['kind', 'id', 'device_id', 'payload']) {
     if (raw[key] == null || raw[key] === '') throw new Error(`missing ${key}`);
   }
-  const payload = JSON.stringify(raw.payload);
+  const revision = Number(raw.revision || 0);
+  if (!Number.isSafeInteger(revision) || revision < 0) throw new Error('invalid revision');
+  const payloadValue = canonicalize(raw.payload);
+  const payload = JSON.stringify(payloadValue);
+  const deletedAt = raw.deleted_at ? String(raw.deleted_at) : null;
   return {
     workspace_id: WORKSPACE_ID,
     kind: String(raw.kind),
     id: String(raw.id),
-    updated_at: String(raw.updated_at),
-    deleted_at: raw.deleted_at ? String(raw.deleted_at) : null,
+    updated_at: `@${Math.floor(Date.now() / 1000)}`,
+    deleted_at: deletedAt,
     device_id: String(raw.device_id),
-    revision: Number(raw.revision || 0),
+    revision,
     payload,
-    checksum: checksum(payload),
+    checksum: itemChecksum(payloadValue, deletedAt !== null),
+  };
+}
+
+function publicItem(row) {
+  if (!row) return null;
+  return {
+    kind: row.kind,
+    id: row.id,
+    updated_at: row.updated_at,
+    deleted_at: row.deleted_at,
+    device_id: row.device_id,
+    revision: row.revision,
+    checksum: row.checksum,
+    payload: JSON.parse(row.payload),
+  };
+}
+
+function activeLease(profileId) {
+  const lease = leaseGet.get(WORKSPACE_ID, profileId);
+  const now = Math.floor(Date.now() / 1000);
+  return lease && lease.expires_at > now ? lease : null;
+}
+
+function conflict(item, reason, current, lease = null) {
+  return {
+    kind: item.kind,
+    id: item.id,
+    reason,
+    base_revision: item.revision,
+    server_revision: current?.revision || 0,
+    holder_device: lease?.device_id || null,
+    holder_label: lease?.device_label || null,
+    expires_at: lease?.expires_at || null,
+    server_item: publicItem(current),
   };
 }
 
@@ -165,59 +230,97 @@ await app.register(multipart, { limits: { fileSize: MAX_BODY } });
 app.get('/health', async () => ({
   ok: true,
   name: 'shardx-sync-server',
+  sync_protocol: SYNC_PROTOCOL,
   workspace_id: WORKSPACE_ID,
   object_storage: Boolean(minio),
   seq: maxSeqStmt.get(WORKSPACE_ID).seq,
 }));
 
-app.post('/sync/push', { preHandler: auth }, async (req) => {
+app.post('/sync/push', { preHandler: auth }, async (req, reply) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (items.length > 2000) return reply.code(400).send({ error: 'too many items' });
+
   const tx = db.transaction((rows) => {
-    let accepted = 0;
+    const accepted = [];
+    const conflicts = [];
     for (const row of rows) {
       const item = normalizeItem(row);
-      upsertItem.run(item);
-      accepted += 1;
+      let current = itemStmt.get(WORKSPACE_ID, item.kind, item.id);
+      const lease = PROFILE_KINDS.has(item.kind) ? activeLease(item.id) : null;
+      if (PROFILE_KINDS.has(item.kind) && (!lease || lease.device_id !== item.device_id)) {
+        conflicts.push(conflict(item, lease ? 'locked' : 'lease_required', current, lease));
+        continue;
+      }
+
+      if (current && current.checksum === item.checksum && current.deleted_at === item.deleted_at) {
+        accepted.push(publicItem(current));
+        continue;
+      }
+      if (!current) {
+        if (item.revision !== 0) {
+          conflicts.push(conflict(item, 'missing', null));
+          continue;
+        }
+        insertItem.run(item);
+      } else {
+        if (item.revision !== current.revision) {
+          conflicts.push(conflict(item, 'stale_revision', current));
+          continue;
+        }
+        if (updateItem.run(item).changes !== 1) {
+          current = itemStmt.get(WORKSPACE_ID, item.kind, item.id);
+          conflicts.push(conflict(item, 'stale_revision', current));
+          continue;
+        }
+      }
+      current = itemStmt.get(WORKSPACE_ID, item.kind, item.id);
+      accepted.push(publicItem(current));
     }
-    return accepted;
+    return { accepted, conflicts };
   });
-  const accepted = tx(items);
-  return { ok: true, accepted, cursor: `seq:${maxSeqStmt.get(WORKSPACE_ID).seq}` };
+
+  let result;
+  try {
+    result = tx(items);
+  } catch (error) {
+    return reply.code(400).send({ error: error.message });
+  }
+  return {
+    ok: result.conflicts.length === 0,
+    protocol: SYNC_PROTOCOL,
+    accepted: result.accepted,
+    conflicts: result.conflicts,
+    cursor: `seq:${maxSeqStmt.get(WORKSPACE_ID).seq}`,
+  };
 });
 
 app.get('/sync/changes', { preHandler: auth }, async (req) => {
   const since = cursorToSeq(req.query?.since);
-  const limit = Math.min(Number(req.query?.limit || 500), 2000);
+  const limit = Math.min(Math.max(Number(req.query?.limit || 500), 1), 2000);
   const rows = changesStmt.all(WORKSPACE_ID, since, limit);
-  const items = rows.map((r) => ({
-    kind: r.kind,
-    id: r.id,
-    updated_at: r.updated_at,
-    deleted_at: r.deleted_at,
-    device_id: r.device_id,
-    revision: r.revision,
-    payload: JSON.parse(r.payload),
-  }));
   const last = rows.length ? rows[rows.length - 1].server_seq : maxSeqStmt.get(WORKSPACE_ID).seq;
-  return { items, cursor: `seq:${last}` };
+  return { protocol: SYNC_PROTOCOL, items: rows.map(publicItem), cursor: `seq:${last}` };
 });
 
 app.get('/sync/item/:kind/:id', { preHandler: auth }, async (req, reply) => {
   const row = itemStmt.get(WORKSPACE_ID, req.params.kind, req.params.id);
   if (!row) return reply.code(404).send({ error: 'not found' });
-  return {
-    kind: row.kind,
-    id: row.id,
-    updated_at: row.updated_at,
-    deleted_at: row.deleted_at,
-    device_id: row.device_id,
-    revision: row.revision,
-    payload: JSON.parse(row.payload),
-  };
+  return publicItem(row);
 });
 
 app.post('/storage/:profileId/:revision', { preHandler: auth }, async (req, reply) => {
   if (!minio) return reply.code(503).send({ error: 'object storage disabled' });
+  const deviceId = String(req.headers['x-shardx-device-id'] || req.query?.device_id || '').trim();
+  if (!deviceId) return reply.code(400).send({ error: 'missing device id' });
+  const lease = activeLease(String(req.params.profileId));
+  if (!lease || lease.device_id !== deviceId) {
+    return reply.code(409).send({
+      error: lease ? 'locked' : 'lease_required',
+      holder_device: lease?.device_id || null,
+      holder_label: lease?.device_label || null,
+      expires_at: lease?.expires_at || null,
+    });
+  }
   const part = await req.file();
   if (!part) return reply.code(400).send({ error: 'missing file' });
   const chunks = [];
@@ -238,8 +341,6 @@ app.get('/storage/:profileId/latest', { preHandler: auth }, async (req, reply) =
   return { profile_id: req.params.profileId, revision: row.revision, checksum: row.checksum, size_bytes: row.size_bytes, url };
 });
 
-// Device lease: TTL-based "in use" lock so two devices don't overwrite each
-// other's cookies. A lease is free when absent or expired (expires_at <= now).
 app.post('/lease/:profileId', { preHandler: auth }, async (req, reply) => {
   const profileId = String(req.params.profileId);
   const deviceId = String(req.body?.device_id || '').trim();
@@ -281,9 +382,7 @@ app.get('/lease/:profileId', { preHandler: auth }, async (req) => {
   const profileId = String(req.params.profileId);
   const now = Math.floor(Date.now() / 1000);
   const existing = leaseGet.get(WORKSPACE_ID, profileId);
-  if (!existing || existing.expires_at <= now) {
-    return { free: true };
-  }
+  if (!existing || existing.expires_at <= now) return { free: true };
   return {
     free: false,
     holder_device: existing.device_id,

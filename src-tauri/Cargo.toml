@@ -25,7 +25,7 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "fs", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "fs", "net", "io-util", "time", "sync"] }
 anyhow = "1"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -68,5 +68,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Cryptography",  # CryptProtectData / CryptUnprotectData
     "Win32_System_JobObjects",      # Kill Chromium child processes with the root
     "Win32_System_Threading",       # OpenProcess / process handles for job ownership
+    "Win32_Storage_FileSystem",     # Atomic replacement of persisted JSON files
 ] }
 
