@@ -129,17 +129,17 @@ pub async fn launch_profile(
     let proxy_public_ip = effective_geo
         .map(|g| g.ip.as_str())
         .filter(|ip| !ip.is_empty());
-    let host_public_ips = if engine == profile::ENGINE_IXBROWSER_145 && bound_proxy.is_some() {
+    let host_public_ips = if profile::is_ixbrowser_engine(engine) && bound_proxy.is_some() {
         host_source_ips()
     } else {
         Vec::new()
     };
-    if engine == profile::ENGINE_IXBROWSER_145
+    if profile::is_ixbrowser_engine(engine)
         && bound_proxy.is_some()
         && (proxy_public_ip.is_none() || host_public_ips.is_empty())
     {
         anyhow::bail!(
-            "Chromium 145 WebRTC replacement data is incomplete; test or rebind the proxy before launch"
+            "ixBrowser WebRTC replacement data is incomplete; test or rebind the proxy before launch"
         );
     }
     let profile_name = stored
@@ -149,8 +149,9 @@ pub async fn launch_profile(
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("untitled");
 
-    let (bin, mut engine_args) = if engine == profile::ENGINE_IXBROWSER_145 {
+    let (bin, mut engine_args, mut disabled_features) = if profile::is_ixbrowser_engine(engine) {
         let config = crate::ixbrowser::build_launch_config(
+            engine,
             profile_id,
             profile_name,
             &raw,
@@ -160,12 +161,16 @@ pub async fn launch_profile(
             proxy_public_ip,
             &resolved_timezone,
         )?;
-        (config.binary, config.args)
+        (config.binary, config.args, config.disabled_features)
     } else {
         // Pass fingerprint by file path — inline JSON overflows Windows' 32767-char CreateProcess limit.
         let fp_file = udd.join("fingerprint.json");
         std::fs::write(&fp_file, &json).context("write fingerprint.json")?;
-        (resolve_binary()?, vec![format!("--fingerprint-profile={}", fp_file.display())])
+        (
+            resolve_binary()?,
+            vec![format!("--fingerprint-profile={}", fp_file.display())],
+            Vec::new(),
+        )
     };
 
     // Pre-warm Widevine CDM to avoid first-DRM-page component-updater stall.
@@ -174,7 +179,7 @@ pub async fn launch_profile(
     }
 
     let mut cmd = tokio::process::Command::new(&bin);
-    if engine == profile::ENGINE_IXBROWSER_145 {
+    if profile::is_ixbrowser_engine(engine) {
         if let Some(parent) = bin.parent() {
             cmd.current_dir(parent);
         }
@@ -191,14 +196,13 @@ pub async fn launch_profile(
     let keep_cdp_active = enable_cdp
         && !headless
         && settings::load()?.api_disable_background_throttling;
-    let mut disabled_features = Vec::new();
-    if !webgpu_present {
-        disabled_features.push("WebGPU");
+    if engine != profile::ENGINE_IXBROWSER_145 && !webgpu_present {
+        disabled_features.push("WebGPU".into());
     }
-    if keep_cdp_active {
-        disabled_features.push("CalculateNativeWinOcclusion");
+    if engine != profile::ENGINE_IXBROWSER_145 && keep_cdp_active {
+        disabled_features.push("CalculateNativeWinOcclusion".into());
     }
-    if !disabled_features.is_empty() && engine != profile::ENGINE_IXBROWSER_145 {
+    if !disabled_features.is_empty() {
         cmd.arg(format!("--disable-features={}", disabled_features.join(",")));
     }
     if keep_cdp_active {
@@ -257,14 +261,14 @@ pub async fn launch_profile(
     match webrtc_mode {
         "block" => {
             cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
-            if engine != profile::ENGINE_IXBROWSER_145 {
+            if !profile::is_ixbrowser_engine(engine) {
                 cmd.arg("--shardx-webrtc-policy=block");
             }
             eprintln!("[launcher] WebRTC blocked (servers stripped, relay-only, UDP off)");
         }
         "tcp_only" => {
             cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
-            if engine != profile::ENGINE_IXBROWSER_145 {
+            if !profile::is_ixbrowser_engine(engine) {
                 cmd.arg("--shardx-webrtc-policy=tcp_only");
                 if let Some(ip) = proxy_public_ip.as_deref() {
                     cmd.arg(format!("--shardx-webrtc-public-ip={ip}"));
@@ -280,7 +284,7 @@ pub async fn launch_profile(
                 eprintln!("[launcher] WebRTC auto -> native (no proxy bound)");
             } else if !proxy_udp_ok {
                 cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
-                if engine != profile::ENGINE_IXBROWSER_145 {
+                if !profile::is_ixbrowser_engine(engine) {
                     cmd.arg("--shardx-webrtc-policy=tcp_only");
                     if let Some(ip) = proxy_public_ip.as_deref() {
                         cmd.arg(format!("--shardx-webrtc-public-ip={ip}"));
@@ -296,7 +300,7 @@ pub async fn launch_profile(
     // Screen resolution mode: presence-only switch to use host monitor.
     let s = settings::load()?;
     if s.screen_resolution_mode.as_deref() == Some("real")
-        && engine != profile::ENGINE_IXBROWSER_145
+        && !profile::is_ixbrowser_engine(engine)
     {
         cmd.arg("--shardx-real-screen");
     }

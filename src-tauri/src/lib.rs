@@ -455,8 +455,7 @@ async fn profile_save(
         .and_then(|meta| meta.get("browser_engine"))
         .and_then(Value::as_str)
         .unwrap_or(profile::ENGINE_SHARDX);
-    let needs_ixbrowser_webrtc =
-        profile::normalize_browser_engine(engine) == profile::ENGINE_IXBROWSER_145;
+    let needs_ixbrowser_webrtc = profile::is_ixbrowser_engine(engine);
     let uses_proxy_auto = payload
         .as_object()
         .map(profile::uses_proxy_auto_fields)
@@ -530,10 +529,9 @@ pub fn save_profile_core(
     let mut stored: profile::StoredProfile =
         serde_json::from_value(payload).map_err(|e| e.to_string())?;
     if is_new
-        && profile::normalize_browser_engine(&stored.meta.browser_engine)
-            == profile::ENGINE_IXBROWSER_145
+        && profile::is_ixbrowser_engine(&stored.meta.browser_engine)
     {
-        crate::ixbrowser::resolve_binary().map_err(|e| e.to_string())?;
+        crate::ixbrowser::resolve_binary(&stored.meta.browser_engine).map_err(|e| e.to_string())?;
     }
     profile::save_raw(&mut stored).map_err(|e| e.to_string())?;
     let name = stored
@@ -579,9 +577,7 @@ async fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Res
         let entry = proxy::get(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "selected proxy no longer exists".to_string())?;
-        if profile::normalize_browser_engine(&p.meta.browser_engine)
-            == profile::ENGINE_IXBROWSER_145
-        {
+        if profile::is_ixbrowser_engine(&p.meta.browser_engine) {
             proxy::ensure_ixbrowser_webrtc(&entry).await.map_err(|e| {
                 format!("Proxy GeoIP/WebRTC preparation failed: {e}. Test the proxy, then bind it again.")
             })?;
@@ -1533,6 +1529,8 @@ pub fn run() {
             runtime::runtime_install,
             ixbrowser::ixbrowser_status,
             ixbrowser::ixbrowser_install,
+            ixbrowser::ixbrowser_148_status,
+            ixbrowser::ixbrowser_148_install,
             runtime::launcher_update_check,
             wayfern::wayfern_status,
             wayfern::wayfern_install,

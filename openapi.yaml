@@ -839,9 +839,9 @@ components:
         notes: { type: string }
         browser_engine:
           type: string
-          enum: [shardx, ixbrowser-145]
-          default: shardx
-          description: Per-profile Chromium base. `ixbrowser-145` is Windows-only and requires a locally configured binary.
+          enum: [ixbrowser-148, shardx, ixbrowser-145]
+          default: ixbrowser-148
+          description: Per-profile Chromium base. `ixbrowser-148` is the default for new profiles; both ixBrowser engines are Windows-only and require a downloaded or locally configured runtime.
         proxy_id:
           type: string
           description: Bind a proxy already in the store (by id).
@@ -887,10 +887,14 @@ components:
         platform:
           type: string
           enum: [Windows, macOS, Linux]
-          description: Used to pick a random fingerprint when `fingerprint_id` is omitted; host OS when both omitted.
+          description: Used to pick a random fingerprint when `fingerprint_id` is omitted; Windows when the default ixBrowser 148 engine is used.
+        browser_engine:
+          type: string
+          enum: [ixbrowser-148, shardx, ixbrowser-145]
+          default: ixbrowser-148
         proxy:
           type: string
-          description: Inline proxy string (not saved to the store).
+          description: Inline proxy string. ShardX keeps it inline; ixBrowser stores and full-tests it before creation so launch can reuse cached GeoIP/WebRTC mapping.
         name: { type: string }
         folder: { type: string }
 
@@ -901,7 +905,7 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         notes: { type: string }
-        browser_engine: { type: string, enum: [shardx, ixbrowser-145], default: shardx }
+        browser_engine: { type: string, enum: [ixbrowser-148, shardx, ixbrowser-145], default: ixbrowser-148 }
         proxy_id: { type: string, nullable: true }
         last_launched_at: { type: string, nullable: true, description: ISO-8601 or null. }
         created_at: { type: string, nullable: true }
@@ -931,7 +935,7 @@ components:
           type: object
           properties:
             id: { type: string, format: uuid }
-            browser_engine: { type: string, enum: [shardx, ixbrowser-145], default: shardx }
+            browser_engine: { type: string, enum: [ixbrowser-148, shardx, ixbrowser-145], default: shardx }
             proxy_id: { type: string, nullable: true }
             inline_proxy:
               nullable: true
@@ -964,7 +968,7 @@ components:
       type: object
       properties:
         profile_id: { type: string }
-        browser_engine: { type: string, enum: [shardx, ixbrowser-145] }
+        browser_engine: { type: string, enum: [ixbrowser-148, shardx, ixbrowser-145] }
         pid: { type: integer, format: int64 }
         cdp:
           nullable: true

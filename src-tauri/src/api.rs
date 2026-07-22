@@ -228,19 +228,24 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
 
     let folder = folder_override.or(body.folder).unwrap_or_default();
     let engine = crate::profile::normalize_browser_engine(
-        body.browser_engine.as_deref().unwrap_or(crate::profile::ENGINE_SHARDX),
+        body.browser_engine
+            .as_deref()
+            .unwrap_or(crate::profile::DEFAULT_NEW_BROWSER_ENGINE),
     );
-    if engine == crate::profile::ENGINE_IXBROWSER_145
+    if crate::profile::is_ixbrowser_engine(engine)
         && cfg.get("navigator").and_then(|v| v.get("platform")).and_then(Value::as_str) != Some("Windows")
     {
-        return Err(err(StatusCode::BAD_REQUEST, "ixbrowser-145 requires a Windows fingerprint"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("{engine} requires a Windows fingerprint"),
+        ));
     }
     let mut meta = json!({ "id": "", "folder": folder, "browser_engine": engine });
     if let Some(pid) = body.proxy_id.as_ref() {
         let entry = crate::proxy::get(pid)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "selected proxy no longer exists"))?;
-        if engine == crate::profile::ENGINE_IXBROWSER_145 {
+        if crate::profile::is_ixbrowser_engine(engine) {
             crate::proxy::ensure_ixbrowser_webrtc(&entry)
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
@@ -258,7 +263,7 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
         crate::proxy::full_test(&stored)
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy test failed: {e}")))?;
-        if engine == crate::profile::ENGINE_IXBROWSER_145 {
+        if crate::profile::is_ixbrowser_engine(engine) {
             crate::proxy::ensure_ixbrowser_webrtc(&stored)
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
@@ -290,6 +295,7 @@ async fn create_profile_in_folder(Path(folder): Path<String>, Json(body): Json<C
 struct TempReq {
     fingerprint_id: Option<String>,
     platform: Option<String>,
+    browser_engine: Option<String>,
     /// Inline proxy (not stored).
     proxy: Option<String>,
     name: Option<String>,
@@ -298,26 +304,54 @@ struct TempReq {
 
 /// Temporary profile (hidden, auto-deleted on close); pair with /start.
 async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
+    let engine = crate::profile::normalize_browser_engine(
+        body.browser_engine
+            .as_deref()
+            .unwrap_or(crate::profile::DEFAULT_NEW_BROWSER_ENGINE),
+    );
+    let platform = body.platform.as_deref().or_else(|| {
+        crate::profile::is_ixbrowser_engine(engine).then_some("Windows")
+    });
     let fid = match body.fingerprint_id {
         Some(f) => f,
-        None => random_fingerprint_for(body.platform.as_deref())?,
+        None => random_fingerprint_for(platform)?,
     };
     let mut cfg = crate::build_fingerprint_config(crate::main_window().as_ref(), &fid)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     cfg.remove("_meta");
+    if crate::profile::is_ixbrowser_engine(engine)
+        && cfg.get("navigator").and_then(|v| v.get("platform")).and_then(Value::as_str) != Some("Windows")
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("{engine} requires a Windows fingerprint"),
+        ));
+    }
     if let Some(n) = body.name.as_ref() {
         cfg.insert("name".into(), json!(n));
     }
     let mut meta = json!({
         "id": "",
         "folder": body.folder.unwrap_or_default(),
-        "browser_engine": crate::profile::ENGINE_SHARDX,
+        "browser_engine": engine,
         "temporary": true
     });
     if let Some(pstr) = body.proxy.as_ref() {
-        let entry = crate::proxy::parse_single(pstr)
+        let mut entry = crate::proxy::parse_single(pstr)
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
-        meta["inline_proxy"] = serde_json::to_value(entry).unwrap_or(Value::Null);
+        if crate::profile::is_ixbrowser_engine(engine) {
+            entry = crate::proxy::upsert(entry)
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            crate::proxy::full_test(&entry)
+                .await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy test failed: {e}")))?;
+            crate::proxy::ensure_ixbrowser_webrtc(&entry)
+                .await
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
+            meta["proxy_id"] = json!(entry.id);
+        } else {
+            meta["inline_proxy"] = serde_json::to_value(entry).unwrap_or(Value::Null);
+        }
     }
     cfg.insert("_meta".into(), meta);
 
@@ -328,7 +362,7 @@ async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
         "name": pm.name,
         "fingerprint_id": fid,
         "temporary": true,
-        "proxy_inline": body.proxy.is_some(),
+        "proxy_inline": body.proxy.is_some() && !crate::profile::is_ixbrowser_engine(engine),
     })))
 }
 
@@ -381,9 +415,7 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
             let entry = crate::proxy::get(pid)
                 .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
                 .ok_or_else(|| err(StatusCode::BAD_REQUEST, "selected proxy no longer exists"))?;
-            if crate::profile::normalize_browser_engine(&stored.meta.browser_engine)
-                == crate::profile::ENGINE_IXBROWSER_145
-            {
+            if crate::profile::is_ixbrowser_engine(&stored.meta.browser_engine) {
                 crate::proxy::ensure_ixbrowser_webrtc(&entry)
                     .await
                     .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;
@@ -403,9 +435,7 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
         crate::proxy::full_test(&s)
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy test failed: {e}")))?;
-        if crate::profile::normalize_browser_engine(&stored.meta.browser_engine)
-            == crate::profile::ENGINE_IXBROWSER_145
-        {
+        if crate::profile::is_ixbrowser_engine(&stored.meta.browser_engine) {
             crate::proxy::ensure_ixbrowser_webrtc(&s)
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("proxy GeoIP/WebRTC preparation failed: {e}")))?;

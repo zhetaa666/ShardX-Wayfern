@@ -249,7 +249,7 @@ function useContextMenu() {
 
 // ---- backend types ----
 
-type BrowserEngine = "shardx" | "ixbrowser-145";
+type BrowserEngine = "shardx" | "ixbrowser-145" | "ixbrowser-148";
 type ProfileMeta = {
   id: string;
   name: string;
@@ -279,6 +279,7 @@ type ProxyEntry = {
 type Settings = {
   browser_path: string | null;
   ixbrowser_145_path: string | null;
+  ixbrowser_148_path: string | null;
   theme: string;
   geo_checker?: string | null;
   screen_resolution_mode?: string | null;
@@ -511,7 +512,7 @@ const defaultForm = (): ProfileForm => ({
   id: "",
   name: "",
   notes: "",
-  browser_engine: "shardx",
+  browser_engine: "ixbrowser-148",
   proxy_id: null,
 
   // Empty until snapped to gpusForOs[0] by useEffect.
@@ -547,11 +548,20 @@ const defaultForm = (): ProfileForm => ({
   media_video_in: 1,
 });
 
+function browserEngineLabel(engine: BrowserEngine, compatibility = false): string {
+  if (engine === "ixbrowser-148") return compatibility ? "Chromium 148 compatibility" : "Chromium 148";
+  if (engine === "ixbrowser-145") return compatibility ? "Chromium 145 compatibility" : "Chromium 145";
+  return compatibility ? "ShardX Chromium 149" : "ShardX 149";
+}
+
 function fromStored(stored: any): ProfileForm {
   const f = defaultForm();
   if (!stored) return f;
   f.id = stored?._meta?.id ?? "";
-  f.browser_engine = stored?._meta?.browser_engine === "ixbrowser-145" ? "ixbrowser-145" : "shardx";
+  const storedEngine = stored?._meta?.browser_engine;
+  f.browser_engine = storedEngine === "ixbrowser-145" || storedEngine === "ixbrowser-148"
+    ? storedEngine
+    : "shardx";
   f.proxy_id = stored?._meta?.proxy_id ?? null;
   f.name = stored?.name ?? "";
   f.notes = stored?.notes ?? "";
@@ -1822,7 +1832,7 @@ function BrowsersView() {
                     {p.name}
                   </div>
                   <div className="name-sub">
-                    {p.id.slice(0, 8)} · {p.browser_engine === "ixbrowser-145" ? "Chromium 145" : "ShardX 149"}
+                    {p.id.slice(0, 8)} · {browserEngineLabel(p.browser_engine)}
                   </div>
                 </div>
                 <div>
@@ -2048,10 +2058,11 @@ function InlineEditor({
   const f = draft;
   const u = <K extends keyof ProfileForm>(k: K, v: ProfileForm[K]) => setDraft({ ...f, [k]: v });
 
-  // OS filter init from bound fingerprint's platform; new profile uses host OS.
+  // ixBrowser engines are Windows-only; ShardX profiles can follow the host.
   const currentFp = fingerprints.find((x) => x.id === f.gpu_preset_id);
+  const ixBrowserSelected = f.browser_engine !== "shardx";
   const [osFilter, setOsFilter] = useState<OsPlatform>(
-    (currentFp?.platform as OsPlatform) ?? HOST_OS
+    ixBrowserSelected ? "Windows" : ((currentFp?.platform as OsPlatform) ?? HOST_OS)
   );
   const gpusForOs = useMemo(
     () => fingerprints.filter((fp) => fp.platform === osFilter),
@@ -2059,7 +2070,7 @@ function InlineEditor({
   );
 
   /// Pick GPU = full fingerprint snap; toStored carries lib.payload at save.
-  const setGpu = async (id: string) => {
+  const setGpu = async (id: string, overrides: Partial<ProfileForm> = {}) => {
     const fp = fingerprints.find((x) => x.id === id);
     if (!fp) return;
     const nav = fp.payload?.navigator ?? {};
@@ -2075,6 +2086,7 @@ function InlineEditor({
     }
     setDraft({
       ...f,
+      ...overrides,
       gpu_preset_id: id,
       hardware_concurrency: picks.hardware_concurrency ?? nav.hardware_concurrency ?? f.hardware_concurrency,
       device_memory: picks.device_memory ?? nav.device_memory ?? f.device_memory,
@@ -2095,13 +2107,17 @@ function InlineEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fingerprints, osFilter, f.gpu_preset_id]);
 
-  const pickOs = (os: OsPlatform) => {
+  const pickOs = (os: OsPlatform, overrides: Partial<ProfileForm> = {}) => {
     setOsFilter(os);
     // Switch GPU to first of new OS if current doesn't match.
     if (currentFp && currentFp.platform !== os) {
       const first = fingerprints.find((g) => g.platform === os);
-      if (first) setGpu(first.id);
+      if (first) {
+        setGpu(first.id, overrides);
+        return;
+      }
     }
+    if (Object.keys(overrides).length > 0) setDraft({ ...f, ...overrides });
   };
 
   return (
@@ -2117,13 +2133,21 @@ function InlineEditor({
             <span className="lbl">Base Chromium</span>
             {f.id ? (
               <div className="mono-field">
-                {f.browser_engine === "ixbrowser-145" ? "Chromium 145 compatibility" : "ShardX Chromium 149"}
+                {browserEngineLabel(f.browser_engine, true)}
               </div>
             ) : (
               <CSSelect
                 value={f.browser_engine}
-                onChange={(v) => u("browser_engine", v as BrowserEngine)}
+                onChange={(v) => {
+                  const engine = v as BrowserEngine;
+                  if (engine !== "shardx" && osFilter !== "Windows") {
+                    pickOs("Windows", { browser_engine: engine });
+                  } else {
+                    u("browser_engine", engine);
+                  }
+                }}
                 options={[
+                  { value: "ixbrowser-148", label: "Chromium 148 compatibility (Windows, default)" },
                   { value: "shardx", label: "ShardX Chromium 149" },
                   { value: "ixbrowser-145", label: "Chromium 145 compatibility (Windows)" },
                 ]}
@@ -2141,6 +2165,8 @@ function InlineEditor({
                   type="button"
                   className={`seg-btn ${osFilter === o.id ? "active" : ""}`}
                   onClick={() => pickOs(o.id)}
+                  disabled={ixBrowserSelected && o.id !== "Windows"}
+                  title={ixBrowserSelected && o.id !== "Windows" ? "ixBrowser engines require a Windows fingerprint" : undefined}
                 >
                   {o.label}
                 </button>
@@ -5103,6 +5129,7 @@ function SettingsView() {
   const [s, setS] = useState<Settings>({
     browser_path: null,
     ixbrowser_145_path: null,
+    ixbrowser_148_path: null,
     theme: "dark",
     geo_checker: "ixbrowser.com",
     screen_resolution_mode: "fingerprint",
@@ -5120,14 +5147,20 @@ function SettingsView() {
     sync_device_label: null,
   });
   const [api, setApi] = useState<ApiInfo | null>(null);
-  const [ixStatus, setIxStatus] = useState<IxBrowserStatus | null>(null);
-  const [ixProgress, setIxProgress] = useState<IxBrowserProgress | null>(null);
-  const [ixBusy, setIxBusy] = useState(false);
+  const [ix145Status, setIx145Status] = useState<IxBrowserStatus | null>(null);
+  const [ix145Progress, setIx145Progress] = useState<IxBrowserProgress | null>(null);
+  const [ix145Busy, setIx145Busy] = useState(false);
+  const [ix148Status, setIx148Status] = useState<IxBrowserStatus | null>(null);
+  const [ix148Progress, setIx148Progress] = useState<IxBrowserProgress | null>(null);
+  const [ix148Busy, setIx148Busy] = useState(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const syncRuntime = useSyncRuntime();
   const syncBusy = syncRuntime.active;
   const refreshApi = () => invoke<ApiInfo>("api_info").then(setApi).catch(() => {});
-  const refreshIx = () => invoke<IxBrowserStatus>("ixbrowser_status").then(setIxStatus).catch(() => {});
+  const refreshIx = () => {
+    invoke<IxBrowserStatus>("ixbrowser_status").then(setIx145Status).catch(() => {});
+    invoke<IxBrowserStatus>("ixbrowser_148_status").then(setIx148Status).catch(() => {});
+  };
   const refreshSync = () => invoke<SyncStatus>("sync_status").then((st) => {
     setSyncStatus(st);
     setS((cur) => ({ ...cur, sync_device_id: st.device_id, sync_last_cursor: st.last_cursor ?? null }));
@@ -5135,15 +5168,20 @@ function SettingsView() {
   useEffect(() => {
     invoke<Settings>("settings_get").then(setS);
     refreshApi(); refreshIx(); refreshSync();
-    let offProgress: (() => void) | undefined;
-    let offDone: (() => void) | undefined;
-    listen<IxBrowserProgress>("ixbrowser:progress", (e) => setIxProgress(e.payload)).then((fn) => { offProgress = fn; });
+    const cleanups: Array<() => void> = [];
+    listen<IxBrowserProgress>("ixbrowser:progress", (e) => setIx145Progress(e.payload)).then((fn) => cleanups.push(fn));
     listen<IxBrowserStatus>("ixbrowser:done", (e) => {
-      setIxStatus(e.payload);
-      setIxBusy(false);
-      setIxProgress(null);
-    }).then((fn) => { offDone = fn; });
-    return () => { offProgress?.(); offDone?.(); };
+      setIx145Status(e.payload);
+      setIx145Busy(false);
+      setIx145Progress(null);
+    }).then((fn) => cleanups.push(fn));
+    listen<IxBrowserProgress>("ixbrowser148:progress", (e) => setIx148Progress(e.payload)).then((fn) => cleanups.push(fn));
+    listen<IxBrowserStatus>("ixbrowser148:done", (e) => {
+      setIx148Status(e.payload);
+      setIx148Busy(false);
+      setIx148Progress(null);
+    }).then((fn) => cleanups.push(fn));
+    return () => cleanups.forEach((fn) => fn());
   }, []);
   const regenToken = async () => {
     try { setApi(await invoke<ApiInfo>("api_regenerate_token")); toast.ok("Token regenerated"); }
@@ -5162,15 +5200,22 @@ function SettingsView() {
     } catch (e) { toast.err("MCP download failed: " + String(e)); }
     finally { setMcpBusy(false); }
   };
-  const installIx = async (force: boolean) => {
-    setIxBusy(true);
-    setIxProgress(null);
+  const installIx = async (version: 145 | 148, force: boolean) => {
+    const is148 = version === 148;
+    if (is148) {
+      setIx148Busy(true);
+      setIx148Progress(null);
+    } else {
+      setIx145Busy(true);
+      setIx145Progress(null);
+    }
     try {
-      const status = await invoke<IxBrowserStatus>("ixbrowser_install", { force });
-      setIxStatus(status);
+      const command = is148 ? "ixbrowser_148_install" : "ixbrowser_install";
+      const status = await invoke<IxBrowserStatus>(command, { force });
+      if (is148) setIx148Status(status); else setIx145Status(status);
       toast.ok(`Chromium ${status.version} installed`);
-    } catch (e) { toast.err("Chromium 145 install failed: " + String(e)); }
-    finally { setIxBusy(false); }
+    } catch (e) { toast.err(`Chromium ${version} install failed: ${String(e)}`); }
+    finally { if (is148) setIx148Busy(false); else setIx145Busy(false); }
   };
   const save = async () => {
     try { await invoke("settings_save", { value: s }); refreshIx(); toast.ok("Settings saved"); }
@@ -5201,46 +5246,65 @@ function SettingsView() {
       <Topbar crumbs={["System", "Settings"]} search="" onSearch={() => {}} />
       <div className="page-title"><h1>Settings</h1></div>
 
-      <div className="card" style={{ marginBottom: 14 }}>
-        <h3>Chromium 145 compatibility</h3>
-        <p className="muted small">
-          Optional Windows-only engine. Download it from your ShardX R2 runtime, or choose a local
-          ixBrowser Chromium 145 <code>chrome.exe</code>. ShardX Chromium remains the default.
-        </p>
-        <div className="row-inline" style={{ gap: 10, marginBottom: 12 }}>
-          <span className={`status-pill ${ixStatus?.installed ? "status-active" : "status-failed"}`}>
-            {ixStatus?.installed ? `Installed · ${ixStatus.version}` : "Not installed"}
-          </span>
-          {ixStatus?.binary_path && <span className="mono small muted">{ixStatus.binary_path}</span>}
-          <button className="btn-primary" disabled={ixBusy} onClick={() => installIx(!!ixStatus?.installed)}>
-            <Icon.Download /> {ixBusy ? "Installing…" : ixStatus?.installed ? "Reinstall" : "Download engine"}
-          </button>
+      {([
+        {
+          version: 148 as const,
+          status: ix148Status,
+          progress: ix148Progress,
+          busy: ix148Busy,
+          path: s.ixbrowser_148_path,
+          setPath: (path: string | null) => setS({ ...s, ixbrowser_148_path: path }),
+        },
+        {
+          version: 145 as const,
+          status: ix145Status,
+          progress: ix145Progress,
+          busy: ix145Busy,
+          path: s.ixbrowser_145_path,
+          setPath: (path: string | null) => setS({ ...s, ixbrowser_145_path: path }),
+        },
+      ]).map((engine) => (
+        <div className="card" style={{ marginBottom: 14 }} key={engine.version}>
+          <h3>Chromium {engine.version} compatibility{engine.version === 148 ? " · default" : ""}</h3>
+          <p className="muted small">
+            Windows-only engine. Download the pinned ShardX runtime, or choose a complete local
+            ixBrowser Chromium {engine.version} <code>chrome.exe</code> bundle.
+          </p>
+          <div className="row-inline" style={{ gap: 10, marginBottom: 12 }}>
+            <span className={`status-pill ${engine.status?.installed ? "status-active" : "status-failed"}`}>
+              {engine.status?.installed ? `Installed · ${engine.status.version}` : "Not installed"}
+            </span>
+            {engine.status?.binary_path && <span className="mono small muted">{engine.status.binary_path}</span>}
+            <button className="btn-primary" disabled={engine.busy} onClick={() => installIx(engine.version, !!engine.status?.installed)}>
+              <Icon.Download /> {engine.busy ? "Installing…" : engine.status?.installed ? "Reinstall" : "Download engine"}
+            </button>
+          </div>
+          {engine.progress && (
+            <div style={{ marginBottom: 12 }}>
+              <div className="muted small">{engine.progress.phase} · {engine.progress.percent}% · {engine.progress.source}</div>
+              <progress value={engine.progress.percent} max={100} style={{ width: "100%" }} />
+            </div>
+          )}
+          <label>
+            <span className="lbl">Chromium {engine.version} executable</span>
+            <div className="row-inline" style={{ gap: 8 }}>
+              <input className="mono" value={engine.path ?? ""} readOnly placeholder="Not configured" />
+              <button className="btn-ghost" onClick={async () => {
+                const path = await open({
+                  multiple: false,
+                  directory: false,
+                  title: `Select ixBrowser Chromium ${engine.version} chrome.exe`,
+                  filters: [{ name: "Chromium executable", extensions: ["exe"] }],
+                });
+                if (typeof path === "string") engine.setPath(path);
+              }}>Browse…</button>
+              {engine.path && (
+                <button className="btn-ghost" onClick={() => engine.setPath(null)}>Clear</button>
+              )}
+            </div>
+          </label>
         </div>
-        {ixProgress && (
-          <div style={{ marginBottom: 12 }}>
-            <div className="muted small">{ixProgress.phase} · {ixProgress.percent}% · {ixProgress.source}</div>
-            <progress value={ixProgress.percent} max={100} style={{ width: "100%" }} />
-          </div>
-        )}
-        <label>
-          <span className="lbl">Chromium 145 executable</span>
-          <div className="row-inline" style={{ gap: 8 }}>
-            <input className="mono" value={s.ixbrowser_145_path ?? ""} readOnly placeholder="Not configured" />
-            <button className="btn-ghost" onClick={async () => {
-              const path = await open({
-                multiple: false,
-                directory: false,
-                title: "Select ixBrowser Chromium 145 chrome.exe",
-                filters: [{ name: "Chromium executable", extensions: ["exe"] }],
-              });
-              if (typeof path === "string") setS({ ...s, ixbrowser_145_path: path });
-            }}>Browse…</button>
-            {s.ixbrowser_145_path && (
-              <button className="btn-ghost" onClick={() => setS({ ...s, ixbrowser_145_path: null })}>Clear</button>
-            )}
-          </div>
-        </label>
-      </div>
+      ))}
 
       <div className="card" style={{ marginBottom: 14 }}>
         <h3>Proxy geo checker</h3>
