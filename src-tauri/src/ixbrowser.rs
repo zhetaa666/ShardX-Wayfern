@@ -13,15 +13,61 @@ const STANDARD_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const IXB_ALPHABET: &[u8; 64] =
     b"hTy1bfRJz4nLPcBCO7WtmNIaGvVeul5Zo8kq32UxrYw_-0gsjp96SDFXQiEMKdHA";
-const IXB_VERSION: &str = "145.0.7632.159";
-const IXB_UA_VERSION: &str = "145.0.7632.6";
-const ARCHIVE_SIZE: u64 = 186_614_698;
-const ARCHIVE_SHA256: &str = "4ac8b58807133da665af7971b05de5a2518536b15bd8a48db553fc3ee4ca9d0c";
-const OBJECT_PREFIX: &str = "engines/ixbrowser-145/windows-x64/145.0.7632.159";
-const ARCHIVE_NAME: &str = "ShardX-Chromium-145.0.7632.159-Windows-x64.zip";
 const PRIMARY_BASE: &str = "https://shardx.fluxchk.biz.id";
 const FALLBACK_BASE: &str = "https://pub-c075bb957f2f4a26b4bebaee35b0af0f.r2.dev";
-const EXPECTED_ENTRYPOINT: &str = "ShardX-Chromium-145.0.7632.159-Windows-x64/chrome.exe";
+
+struct EngineSpec {
+    engine: &'static str,
+    label: &'static str,
+    version: &'static str,
+    ua_version: &'static str,
+    archive_size: u64,
+    archive_sha256: &'static str,
+    object_prefix: &'static str,
+    archive_name: &'static str,
+    entrypoint: &'static str,
+    default_dir: &'static str,
+    progress_event: &'static str,
+    done_event: &'static str,
+}
+
+const IXBROWSER_145: EngineSpec = EngineSpec {
+    engine: profile::ENGINE_IXBROWSER_145,
+    label: "Chromium 145",
+    version: "145.0.7632.159",
+    ua_version: "145.0.7632.6",
+    archive_size: 186_614_698,
+    archive_sha256: "4ac8b58807133da665af7971b05de5a2518536b15bd8a48db553fc3ee4ca9d0c",
+    object_prefix: "engines/ixbrowser-145/windows-x64/145.0.7632.159",
+    archive_name: "ShardX-Chromium-145.0.7632.159-Windows-x64.zip",
+    entrypoint: "ShardX-Chromium-145.0.7632.159-Windows-x64/chrome.exe",
+    default_dir: "145-0104",
+    progress_event: "ixbrowser:progress",
+    done_event: "ixbrowser:done",
+};
+
+const IXBROWSER_148: EngineSpec = EngineSpec {
+    engine: profile::ENGINE_IXBROWSER_148,
+    label: "Chromium 148",
+    version: "148.0.7778.167",
+    ua_version: "148.0.7778.59",
+    archive_size: 193_635_357,
+    archive_sha256: "ae688a5bcdaa4dafe53b974b6546780a622c0b3e19ac5e8dd42eca6eac7d7df3",
+    object_prefix: "engines/ixbrowser-148/windows-x64/148.0.7778.167",
+    archive_name: "ShardX-Chromium-148.0.7778.167-Windows-x64.zip",
+    entrypoint: "ShardX-Chromium-148.0.7778.167-Windows-x64/chrome.exe",
+    default_dir: "148-0005",
+    progress_event: "ixbrowser148:progress",
+    done_event: "ixbrowser148:done",
+};
+
+fn engine_spec(engine: &str) -> Result<&'static EngineSpec> {
+    match profile::normalize_browser_engine(engine) {
+        profile::ENGINE_IXBROWSER_145 => Ok(&IXBROWSER_145),
+        profile::ENGINE_IXBROWSER_148 => Ok(&IXBROWSER_148),
+        _ => anyhow::bail!("unsupported ixBrowser engine: {engine}"),
+    }
+}
 
 #[derive(Serialize, Clone)]
 pub struct EngineStatus {
@@ -54,17 +100,26 @@ struct RemoteManifest {
 pub struct LaunchConfig {
     pub binary: PathBuf,
     pub args: Vec<String>,
+    pub disabled_features: Vec<String>,
 }
 
-fn runtime_root() -> Result<PathBuf> {
+fn runtime_root(spec: &EngineSpec) -> Result<PathBuf> {
     Ok(crate::store::config_root()?
         .join("runtimes")
-        .join(profile::ENGINE_IXBROWSER_145)
-        .join(IXB_VERSION))
+        .join(spec.engine)
+        .join(spec.version))
 }
 
-fn downloaded_binary_path() -> Result<PathBuf> {
-    Ok(runtime_root()?.join(EXPECTED_ENTRYPOINT))
+fn downloaded_binary_path(spec: &EngineSpec) -> Result<PathBuf> {
+    Ok(runtime_root(spec)?.join(spec.entrypoint))
+}
+
+fn manual_path(settings: &settings::Settings, spec: &EngineSpec) -> Option<String> {
+    match spec.engine {
+        profile::ENGINE_IXBROWSER_145 => settings.ixbrowser_145_path.clone(),
+        profile::ENGINE_IXBROWSER_148 => settings.ixbrowser_148_path.clone(),
+        _ => None,
+    }
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -81,83 +136,98 @@ fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
-#[tauri::command]
-pub async fn ixbrowser_status() -> Result<EngineStatus, String> {
-    let manual_path = settings::load().ok().and_then(|s| s.ixbrowser_145_path);
-    let binary_path = resolve_binary_optional();
+async fn status(spec: &'static EngineSpec) -> Result<EngineStatus, String> {
+    let configured = settings::load().ok();
+    let manual_path = configured.as_ref().and_then(|s| manual_path(s, spec));
+    let binary_path = resolve_binary_optional(spec);
     Ok(EngineStatus {
         installed: binary_path.is_some(),
-        version: IXB_VERSION.into(),
+        version: spec.version.into(),
         size_bytes: binary_path.as_ref().and_then(|p| p.parent()).map(dir_size),
         binary_path,
         manual_path,
     })
 }
 
-fn resolve_binary_optional() -> Option<PathBuf> {
+#[tauri::command]
+pub async fn ixbrowser_status() -> Result<EngineStatus, String> {
+    status(&IXBROWSER_145).await
+}
+
+#[tauri::command]
+pub async fn ixbrowser_148_status() -> Result<EngineStatus, String> {
+    status(&IXBROWSER_148).await
+}
+
+fn resolve_binary_optional(spec: &EngineSpec) -> Option<PathBuf> {
     let settings = settings::load().ok()?;
-    if let Some(path) = settings.ixbrowser_145_path.filter(|p| !p.trim().is_empty()) {
+    if let Some(path) = manual_path(&settings, spec).filter(|p| !p.trim().is_empty()) {
         let path = PathBuf::from(path);
-        return validate_bundle(&path).ok().map(|_| path);
+        return validate_bundle(&path, spec).ok().map(|_| path);
     }
-    if let Ok(path) = downloaded_binary_path() {
-        if validate_bundle(&path).is_ok() {
+    if let Ok(path) = downloaded_binary_path(spec) {
+        if validate_bundle(&path, spec).is_ok() {
             return Some(path);
         }
     }
     #[cfg(target_os = "windows")]
     {
-        let path = default_binary_path();
-        if validate_bundle(&path).is_ok() {
+        let path = default_binary_path(spec);
+        if validate_bundle(&path, spec).is_ok() {
             return Some(path);
         }
     }
     None
 }
 
-pub fn resolve_binary() -> Result<PathBuf> {
+pub fn resolve_binary(engine: &str) -> Result<PathBuf> {
+    let spec = engine_spec(engine)?;
     #[cfg(not(target_os = "windows"))]
-    anyhow::bail!("Chromium 145 compatibility is available on Windows only");
+    anyhow::bail!("{} compatibility is available on Windows only", spec.label);
 
     #[cfg(target_os = "windows")]
     {
-        if let Some(configured) = settings::load()?
-            .ixbrowser_145_path
+        if let Some(configured) = manual_path(&settings::load()?, spec)
             .filter(|p| !p.trim().is_empty())
             .map(PathBuf::from)
         {
-            validate_bundle(&configured).with_context(|| {
-                format!("configured Chromium 145 path is invalid: {}", configured.display())
+            validate_bundle(&configured, spec).with_context(|| {
+                format!("configured {} path is invalid: {}", spec.label, configured.display())
             })?;
             return Ok(configured);
         }
-        if let Ok(downloaded) = downloaded_binary_path() {
-            if validate_bundle(&downloaded).is_ok() {
+        if let Ok(downloaded) = downloaded_binary_path(spec) {
+            if validate_bundle(&downloaded, spec).is_ok() {
                 return Ok(downloaded);
             }
         }
-        let detected = default_binary_path();
-        if validate_bundle(&detected).is_ok() {
+        let detected = default_binary_path(spec);
+        if validate_bundle(&detected, spec).is_ok() {
             return Ok(detected);
         }
-        anyhow::bail!("Chromium 145 compatibility is not installed. Download it in Settings or choose a local chrome.exe.")
+        anyhow::bail!(
+            "{} compatibility is not installed. Download it in Settings or choose a local chrome.exe.",
+            spec.label
+        )
     }
 }
 
 #[cfg(target_os = "windows")]
-fn default_binary_path() -> PathBuf {
+fn default_binary_path(spec: &EngineSpec) -> PathBuf {
     dirs::config_dir()
         .unwrap_or_default()
         .join("ixBrowser-Resources")
         .join("chrome")
-        .join("145-0104")
+        .join(spec.default_dir)
         .join("chrome.exe")
 }
 
-fn validate_bundle(binary: &Path) -> Result<()> {
-    let dir = binary.parent().context("Chromium 145 binary has no parent directory")?;
+fn validate_bundle(binary: &Path, spec: &EngineSpec) -> Result<()> {
+    let dir = binary
+        .parent()
+        .with_context(|| format!("{} binary has no parent directory", spec.label))?;
     let required = [
-        dir.join(format!("{IXB_VERSION}.manifest")),
+        dir.join(format!("{}.manifest", spec.version)),
         dir.join("chrome.dll"),
         dir.join("resources.pak"),
         dir.join("icudtl.dat"),
@@ -165,49 +235,71 @@ fn validate_bundle(binary: &Path) -> Result<()> {
     ];
     if !binary.is_file() || required.iter().any(|p| !p.is_file()) {
         anyhow::bail!(
-            "{} is not a complete ixBrowser Chromium {IXB_VERSION} bundle",
-            dir.display()
+            "{} is not a complete ixBrowser {} bundle",
+            dir.display(),
+            spec.version
         );
     }
     Ok(())
 }
 
-fn validate_manifest(manifest: &RemoteManifest) -> Result<()> {
-    if manifest.engine != profile::ENGINE_IXBROWSER_145
+fn validate_manifest(manifest: &RemoteManifest, spec: &EngineSpec) -> Result<()> {
+    if manifest.engine != spec.engine
         || manifest.platform != "windows-x64"
-        || manifest.version != IXB_VERSION
-        || manifest.archive_size != ARCHIVE_SIZE
-        || !manifest.archive_sha256.eq_ignore_ascii_case(ARCHIVE_SHA256)
-        || manifest.entrypoint.replace('\\', "/") != EXPECTED_ENTRYPOINT
+        || manifest.version != spec.version
+        || manifest.archive_size != spec.archive_size
+        || !manifest.archive_sha256.eq_ignore_ascii_case(spec.archive_sha256)
+        || manifest.entrypoint.replace('\\', "/") != spec.entrypoint
     {
-        anyhow::bail!("Chromium 145 manifest does not match the pinned runtime");
+        anyhow::bail!("{} manifest does not match the pinned runtime", spec.label);
     }
     Ok(())
 }
 
-fn emit_progress(window: &Window, phase: &str, received: u64, total: u64, source: &str) {
-    let percent = if total == 0 { 0 } else { ((received.saturating_mul(100) / total).min(100)) as u8 };
-    let _ = window.emit("ixbrowser:progress", InstallProgress {
+fn emit_progress(
+    window: &Window,
+    spec: &EngineSpec,
+    phase: &str,
+    received: u64,
+    total: u64,
+    source: &str,
+) {
+    let percent = if total == 0 {
+        0
+    } else {
+        ((received.saturating_mul(100) / total).min(100)) as u8
+    };
+    let _ = window.emit(spec.progress_event, InstallProgress {
         phase: phase.into(), received, total, percent, source: source.into(),
     });
 }
 
-async fn fetch_manifest(url: &str) -> Result<RemoteManifest> {
+async fn fetch_manifest(url: &str, spec: &EngineSpec) -> Result<RemoteManifest> {
     let response = reqwest::Client::new().get(url).send().await?.error_for_status()?;
     let manifest = response.json::<RemoteManifest>().await?;
-    validate_manifest(&manifest)?;
+    validate_manifest(&manifest, spec)?;
     Ok(manifest)
 }
 
-async fn download_archive(window: &Window, archive_url: &str, part: &Path, source: &str) -> Result<()> {
+async fn download_archive(
+    window: &Window,
+    spec: &EngineSpec,
+    archive_url: &str,
+    part: &Path,
+    source: &str,
+) -> Result<()> {
     let mut response = reqwest::Client::new()
         .get(archive_url)
         .send()
         .await?
         .error_for_status()?;
     if let Some(length) = response.content_length() {
-        if length != ARCHIVE_SIZE {
-            anyhow::bail!("Chromium 145 archive length is {length}, expected {ARCHIVE_SIZE}");
+        if length != spec.archive_size {
+            anyhow::bail!(
+                "{} archive length is {length}, expected {}",
+                spec.label,
+                spec.archive_size
+            );
         }
     }
     let mut file = tokio::fs::File::create(part).await?;
@@ -215,16 +307,20 @@ async fn download_archive(window: &Window, archive_url: &str, part: &Path, sourc
     while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk).await?;
         received += chunk.len() as u64;
-        emit_progress(window, "downloading", received, ARCHIVE_SIZE, source);
+        emit_progress(window, spec, "downloading", received, spec.archive_size, source);
     }
     file.flush().await?;
-    if received != ARCHIVE_SIZE {
-        anyhow::bail!("Chromium 145 download is {received} bytes, expected {ARCHIVE_SIZE}");
+    if received != spec.archive_size {
+        anyhow::bail!(
+            "{} download is {received} bytes, expected {}",
+            spec.label,
+            spec.archive_size
+        );
     }
     Ok(())
 }
 
-fn verify_sha256(path: &Path) -> Result<()> {
+fn verify_sha256(path: &Path, spec: &EngineSpec) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 1024 * 1024];
@@ -234,8 +330,8 @@ fn verify_sha256(path: &Path) -> Result<()> {
         hasher.update(&buf[..read]);
     }
     let actual = format!("{:x}", hasher.finalize());
-    if actual != ARCHIVE_SHA256 {
-        anyhow::bail!("Chromium 145 SHA-256 mismatch: {actual}");
+    if actual != spec.archive_sha256 {
+        anyhow::bail!("{} SHA-256 mismatch: {actual}", spec.label);
     }
     Ok(())
 }
@@ -246,7 +342,7 @@ fn extract_archive(zip_path: &Path, staging: &Path) -> Result<()> {
     std::fs::create_dir_all(staging)?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let relative = entry.enclosed_name().context("unsafe path in Chromium 145 archive")?;
+        let relative = entry.enclosed_name().context("unsafe path in ixBrowser archive")?;
         let output = staging.join(relative);
         if entry.is_dir() {
             std::fs::create_dir_all(&output)?;
@@ -259,25 +355,26 @@ fn extract_archive(zip_path: &Path, staging: &Path) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn ixbrowser_install(window: Window, force: bool) -> Result<EngineStatus, String> {
+async fn install(window: Window, force: bool, spec: &'static EngineSpec) -> Result<EngineStatus, String> {
     #[cfg(not(target_os = "windows"))]
-    return Err("Chromium 145 compatibility is available on Windows only".into());
+    return Err(format!("{} compatibility is available on Windows only", spec.label));
 
     #[cfg(target_os = "windows")]
     {
-        let final_root = runtime_root().map_err(|e| e.to_string())?;
+        let final_root = runtime_root(spec).map_err(|e| e.to_string())?;
         if !force {
-            if let Ok(binary) = downloaded_binary_path() {
-                if validate_bundle(&binary).is_ok() {
-                    return ixbrowser_status().await;
+            if let Ok(binary) = downloaded_binary_path(spec) {
+                if validate_bundle(&binary, spec).is_ok() {
+                    return status(spec).await;
                 }
             }
         }
-        let parent = final_root.parent().ok_or("invalid Chromium 145 runtime path")?;
+        let parent = final_root
+            .parent()
+            .ok_or_else(|| format!("invalid {} runtime path", spec.label))?;
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let part = parent.join(format!("{IXB_VERSION}.zip.part"));
-        let staging = parent.join(format!(".{IXB_VERSION}.staging-{}", uuid::Uuid::new_v4()));
+        let part = parent.join(format!("{}.zip.part", spec.version));
+        let staging = parent.join(format!(".{}.staging-{}", spec.version, uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&part);
         let _ = std::fs::remove_dir_all(&staging);
 
@@ -285,13 +382,13 @@ pub async fn ixbrowser_install(window: Window, force: bool) -> Result<EngineStat
         let mut last_error = String::new();
         let mut downloaded = false;
         for (base, source) in sources {
-            let manifest_url = format!("{base}/{OBJECT_PREFIX}/manifest.json");
-            let archive_url = format!("{base}/{OBJECT_PREFIX}/{ARCHIVE_NAME}");
-            emit_progress(&window, "manifest", 0, ARCHIVE_SIZE, source);
+            let manifest_url = format!("{base}/{}/manifest.json", spec.object_prefix);
+            let archive_url = format!("{base}/{}/{}", spec.object_prefix, spec.archive_name);
+            emit_progress(&window, spec, "manifest", 0, spec.archive_size, source);
             let attempt = async {
-                let _manifest = fetch_manifest(&manifest_url).await?;
-                download_archive(&window, &archive_url, &part, source).await?;
-                verify_sha256(&part)?;
+                let _manifest = fetch_manifest(&manifest_url, spec).await?;
+                download_archive(&window, spec, &archive_url, &part, source).await?;
+                verify_sha256(&part, spec)?;
                 Ok::<(), anyhow::Error>(())
             }.await;
             match attempt {
@@ -303,26 +400,37 @@ pub async fn ixbrowser_install(window: Window, force: bool) -> Result<EngineStat
             }
         }
         if !downloaded {
-            return Err(format!("Chromium 145 download failed: {last_error}"));
+            return Err(format!("{} download failed: {last_error}", spec.label));
         }
 
-        emit_progress(&window, "extracting", ARCHIVE_SIZE, ARCHIVE_SIZE, "local");
+        emit_progress(&window, spec, "extracting", spec.archive_size, spec.archive_size, "local");
         extract_archive(&part, &staging).map_err(|e| e.to_string())?;
-        let staged_binary = staging.join(EXPECTED_ENTRYPOINT);
-        validate_bundle(&staged_binary).map_err(|e| e.to_string())?;
+        let staged_binary = staging.join(spec.entrypoint);
+        validate_bundle(&staged_binary, spec).map_err(|e| e.to_string())?;
         if final_root.exists() {
             std::fs::remove_dir_all(&final_root).map_err(|e| e.to_string())?;
         }
         std::fs::rename(&staging, &final_root).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&part);
-        emit_progress(&window, "done", ARCHIVE_SIZE, ARCHIVE_SIZE, "local");
-        let status = ixbrowser_status().await?;
-        let _ = window.emit("ixbrowser:done", status.clone());
+        emit_progress(&window, spec, "done", spec.archive_size, spec.archive_size, "local");
+        let status = status(spec).await?;
+        let _ = window.emit(spec.done_event, status.clone());
         Ok(status)
     }
 }
 
+#[tauri::command]
+pub async fn ixbrowser_install(window: Window, force: bool) -> Result<EngineStatus, String> {
+    install(window, force, &IXBROWSER_145).await
+}
+
+#[tauri::command]
+pub async fn ixbrowser_148_install(window: Window, force: bool) -> Result<EngineStatus, String> {
+    install(window, force, &IXBROWSER_148).await
+}
+
 pub fn build_launch_config(
+    engine: &str,
     profile_id: &str,
     profile_name: &str,
     raw: &Map<String, Value>,
@@ -332,7 +440,8 @@ pub fn build_launch_config(
     webrtc_public_ip: Option<&str>,
     timezone: &str,
 ) -> Result<LaunchConfig> {
-    let binary = resolve_binary()?;
+    let spec = engine_spec(engine)?;
+    let binary = resolve_binary(engine)?;
     let nav = object(raw, "navigator");
     let screen = object(raw, "screen");
     let window = object(raw, "window");
@@ -430,7 +539,8 @@ pub fn build_launch_config(
 
     let ua = format!(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-         (KHTML, like Gecko) Chrome/{IXB_UA_VERSION} Safari/537.36"
+         (KHTML, like Gecko) Chrome/{} Safari/537.36",
+        spec.ua_version
     );
     let renderer = webgl
         .and_then(|v| v.get("renderer"))
@@ -465,8 +575,27 @@ pub fn build_launch_config(
     ) {
         args.push(format!("--window-size={width},{height}"));
     }
+    let disabled_features = if spec.engine == profile::ENGINE_IXBROWSER_148 {
+        args.push("--window-position=0,0".into());
+        [
+            "HttpsUpgrades",
+            "HttpsFirstModeV2ForEngagedSites",
+            "HttpsFirstBalancedMode",
+            "HttpsFirstBalancedModeAutoEnable",
+            "EnableFingerprintingProtectionFilter",
+            "FlashDeprecationWarning",
+            "EnablePasswordsAccountStorage",
+            "RendererCodeIntegrity",
+            "CanvasNoise",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    } else {
+        Vec::new()
+    };
 
-    Ok(LaunchConfig { binary, args })
+    Ok(LaunchConfig { binary, args, disabled_features })
 }
 
 fn build_dynamic_config(

@@ -6,17 +6,26 @@ use std::path::PathBuf;
 
 pub const ENGINE_SHARDX: &str = "shardx";
 pub const ENGINE_IXBROWSER_145: &str = "ixbrowser-145";
+pub const ENGINE_IXBROWSER_148: &str = "ixbrowser-148";
+pub const DEFAULT_NEW_BROWSER_ENGINE: &str = ENGINE_IXBROWSER_148;
 
 fn default_browser_engine() -> String {
     ENGINE_SHARDX.into()
 }
 
 pub fn normalize_browser_engine(engine: &str) -> &'static str {
-    if engine == ENGINE_IXBROWSER_145 {
-        ENGINE_IXBROWSER_145
-    } else {
-        ENGINE_SHARDX
+    match engine {
+        ENGINE_IXBROWSER_145 => ENGINE_IXBROWSER_145,
+        ENGINE_IXBROWSER_148 => ENGINE_IXBROWSER_148,
+        _ => ENGINE_SHARDX,
     }
+}
+
+pub fn is_ixbrowser_engine(engine: &str) -> bool {
+    matches!(
+        normalize_browser_engine(engine),
+        ENGINE_IXBROWSER_145 | ENGINE_IXBROWSER_148
+    )
 }
 
 pub fn uses_proxy_auto_fields(config: &serde_json::Map<String, serde_json::Value>) -> bool {
@@ -546,7 +555,8 @@ fn ixbrowser_user_data_name(id: &str) -> String {
 
 pub fn engine_user_data_dir(id: &str, engine: &str) -> Result<PathBuf> {
     let root = user_data_dir(id)?;
-    let p = if normalize_browser_engine(engine) == ENGINE_IXBROWSER_145 {
+    let normalized = normalize_browser_engine(engine);
+    let p = if normalized == ENGINE_IXBROWSER_145 {
         let legacy = root.join(ENGINE_IXBROWSER_145);
         let isolated = root.join(ixbrowser_user_data_name(id));
         if legacy.exists() && !isolated.exists() {
@@ -561,6 +571,9 @@ pub fn engine_user_data_dir(id: &str, engine: &str) -> Result<PathBuf> {
             }
         }
         isolated
+    } else if normalized == ENGINE_IXBROWSER_148 {
+        root.join(ENGINE_IXBROWSER_148)
+            .join(ixbrowser_user_data_name(id))
     } else {
         root
     };
@@ -585,6 +598,19 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first, "profile-a");
         assert_eq!(second, "profile-b");
+    }
+
+    #[test]
+    fn legacy_engine_defaults_to_shardx() {
+        assert_eq!(normalize_browser_engine(""), ENGINE_SHARDX);
+        assert_eq!(normalize_browser_engine("unknown"), ENGINE_SHARDX);
+    }
+
+    #[test]
+    fn chromium_148_is_the_new_profile_default() {
+        assert_eq!(DEFAULT_NEW_BROWSER_ENGINE, ENGINE_IXBROWSER_148);
+        assert!(is_ixbrowser_engine(ENGINE_IXBROWSER_145));
+        assert!(is_ixbrowser_engine(ENGINE_IXBROWSER_148));
     }
 }
 

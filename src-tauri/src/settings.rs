@@ -10,6 +10,9 @@ pub struct Settings {
     /// Local/private ixBrowser Chromium 145 executable (Windows only).
     #[serde(default)]
     pub ixbrowser_145_path: Option<String>,
+    /// Local/private ixBrowser Chromium 148 executable (Windows only).
+    #[serde(default)]
+    pub ixbrowser_148_path: Option<String>,
     /// Theme: "dark" (default) or "light".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -95,6 +98,7 @@ pub fn load() -> Result<Settings> {
         return Ok(Settings {
             browser_path: None,
             ixbrowser_145_path: None,
+            ixbrowser_148_path: None,
             theme: default_theme(),
             geo_checker: Some("ixbrowser.com".into()),
             screen_resolution_mode: Some("fingerprint".into()),
